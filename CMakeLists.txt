@@ -20,6 +20,7 @@ option(ENABLE_LOCAL_ADDRESS_TRANSLATION "Translate local addresses to localhost"
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
+set(CMAKE_BUILD_TYPE Debug)  # debug mode
 
 include(GNUInstallDirs)
 
