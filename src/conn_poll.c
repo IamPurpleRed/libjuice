@@ -349,6 +349,9 @@ void conn_poll_cleanup(juice_agent_t *agent) {
 	conn_poll_interrupt(agent);
 
 	mutex_destroy(&conn_impl->send_mutex);
+#if USE_XDP
+	remove_port_from_ebpf_map(conn_impl->sock);
+#endif
 	closesocket(conn_impl->sock);
 	free(agent->conn_impl);
 	agent->conn_impl = NULL;

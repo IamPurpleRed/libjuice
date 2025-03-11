@@ -11,6 +11,7 @@ option(NO_TESTS "Disable tests build" OFF)
 option(WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(FUZZER "Enable oss-fuzz fuzzing" OFF)
 option(CLANG_TIDY "Enable clang-tidy" OFF)
+option(USE_XDP "Use Linux XDP technology to receive UDP packets" ON)
 
 # Mitigations
 option(DISABLE_CONSENT_FRESHNESS "Disable RFC 7675 Consent Freshness" OFF)
@@ -249,4 +250,12 @@ if(FUZZER)
 
 	set_target_properties(stun-fuzzer PROPERTIES OUTPUT_NAME fuzzer)
 	target_link_libraries(stun-fuzzer juice-static ${LIB_FUZZING_ENGINE})
+endif()
+
+if(USE_XDP)
+    target_compile_definitions(juice PRIVATE USE_XDP=1)
+    target_compile_definitions(juice-static PRIVATE USE_XDP=1)
+	find_library(LIBBPF_LIBRARY NAMES bpf)
+	target_link_libraries(juice PRIVATE ${LIBBPF_LIBRARY})
+    target_link_libraries(juice-static PRIVATE ${LIBBPF_LIBRARY})
 endif()

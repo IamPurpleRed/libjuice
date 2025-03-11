@@ -17,6 +17,10 @@
 #include <string.h>
 #include <time.h>
 
+#if USE_XDP
+#include <bpf/bpf.h>
+#endif
+
 static struct addrinfo *find_family(struct addrinfo *ai_list, int family) {
 	struct addrinfo *ai = ai_list;
 	while (ai && ai->ai_family != family)
@@ -58,7 +62,7 @@ static socket_t create_socket_for_addrinfo(const udp_socket_config_t *config,
 	if (ai->ai_family == AF_INET6)
 		setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&disabled, sizeof(disabled));
 
-		// Set DF flag
+	// Set DF flag
 #ifndef NO_PMTUDISC
 	const sockopt_t val = IP_PMTUDISC_DO;
 	setsockopt(sock, IPPROTO_IP, IP_MTU_DISCOVER, (const char *)&val, sizeof(val));
@@ -167,7 +171,22 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 		socket_t sock = create_socket_for_addrinfo(config, ai);
 		if (sock != INVALID_SOCKET) {
 			freeaddrinfo(ai_list);
-			return sock;
+#if USE_XDP
+			uint16_t port = udp_get_port(sock);
+			uint8_t value = 1;
+			int bpf_map_fd = bpf_obj_get("/sys/fs/bpf/webrtc_port_map");
+			if (bpf_map_fd >= 0) {
+				if (bpf_map_update_elem(bpf_map_fd, &port, &value, BPF_ANY) == 0) {
+					JLOG_DEBUG("PurpleRed: Added port %hu to eBPF map", port);
+					return sock;
+				}
+
+				JLOG_ERROR("PurpleRed: Failed to update eBPF map with port %hu, errno=%d", port,
+				           errno);
+			} else {
+				JLOG_ERROR("PurpleRed: Failed to get eBPF map");
+			}
+#endif
 		}
 	}
 
@@ -600,3 +619,19 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 
 	return ret;
 }
+
+#if USE_XDP
+void remove_port_from_ebpf_map(socket_t sock) {
+	uint16_t port = udp_get_port(sock);
+	int bpf_map_fd = bpf_obj_get("/sys/fs/bpf/webrtc_port_map");
+	if (bpf_map_fd >= 0) {
+		if (bpf_map_delete_elem(bpf_map_fd, &port) == 0) {
+			JLOG_DEBUG("PurpleRed: Removed port %hu from eBPF map", port);
+		}
+
+		JLOG_ERROR("PurpleRed: Failed to remove port %hu from eBPF map, errno=%d", port, errno);
+	} else {
+		JLOG_ERROR("PurpleRed: Failed to get eBPF map");
+	}
+}
+#endif

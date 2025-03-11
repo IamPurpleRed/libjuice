@@ -65,7 +65,8 @@ conn_registry_t *conn_mux_get_registry(udp_socket_config_t *config) {
 		conn_registry_t *registry = conn_mux_registries[i];
 		registry_impl_t *impl = registry->impl;
 
-		if (impl->port >= config->port_begin && (config->port_end == 0 || impl->port <= config->port_end)) {
+		if (impl->port >= config->port_begin &&
+		    (config->port_end == 0 || impl->port <= config->port_end)) {
 			return registry;
 		}
 	}
@@ -75,8 +76,8 @@ conn_registry_t *conn_mux_get_registry(udp_socket_config_t *config) {
 
 static int conn_mux_add_registry(conn_registry_t *registry) {
 	int i = 0;
-		while (i < conn_mux_registries_size && conn_mux_registries[i])
-			++i;
+	while (i < conn_mux_registries_size && conn_mux_registries[i])
+		++i;
 
 	if (i == conn_mux_registries_size) {
 		int new_size = conn_mux_registries_size * 2;
@@ -89,7 +90,7 @@ static int conn_mux_add_registry(conn_registry_t *registry) {
 		assert(new_size > 0);
 
 		conn_registry_t **new_registries =
-				realloc(conn_mux_registries, new_size * sizeof(conn_registry_t *));
+		    realloc(conn_mux_registries, new_size * sizeof(conn_registry_t *));
 		if (!new_registries) {
 			JLOG_FATAL("Memory reallocation failed for registries array");
 			return -1;
@@ -274,6 +275,9 @@ int conn_mux_registry_init(conn_registry_t *registry, udp_socket_config_t *confi
 
 error:
 	mutex_destroy(&registry_impl->send_mutex);
+#if USE_XDP
+	remove_port_from_ebpf_map(registry_impl->sock);
+#endif
 	closesocket(registry_impl->sock);
 	free(registry_impl->map);
 	free(registry_impl);
@@ -298,6 +302,9 @@ void conn_mux_registry_cleanup(conn_registry_t *registry) {
 	--conn_mux_registries_count;
 
 	mutex_destroy(&registry_impl->send_mutex);
+#if USE_XDP
+	remove_port_from_ebpf_map(registry_impl->sock);
+#endif
 	closesocket(registry_impl->sock);
 	free(registry_impl->map);
 	free(registry->impl);
@@ -383,7 +390,8 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 		if (impl->cb_mux_incoming) {
 			JLOG_DEBUG("Found STUN request with unknown ICE ufrag");
 			char host[ADDR_MAX_NUMERICHOST_LEN];
-			if (getnameinfo((const struct sockaddr *)&src->addr, src->len, host, ADDR_MAX_NUMERICHOST_LEN, NULL, 0, NI_NUMERICHOST)) {
+			if (getnameinfo((const struct sockaddr *)&src->addr, src->len, host,
+			                ADDR_MAX_NUMERICHOST_LEN, NULL, 0, NI_NUMERICHOST)) {
 				JLOG_ERROR("getnameinfo failed, errno=%d", sockerrno);
 				return NULL;
 			}
