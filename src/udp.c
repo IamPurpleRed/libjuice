@@ -177,7 +177,7 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 			int bpf_map_fd = bpf_obj_get("/sys/fs/bpf/webrtc_port_map");
 			if (bpf_map_fd >= 0) {
 				if (bpf_map_update_elem(bpf_map_fd, &port, &value, BPF_ANY) == 0) {
-					JLOG_DEBUG("PurpleRed: Added port %hu to eBPF map", port);
+					JLOG_INFO("PurpleRed: Added port %hu to eBPF map", port);
 					return sock;
 				}
 
@@ -626,7 +626,7 @@ void remove_port_from_ebpf_map(socket_t sock) {
 	int bpf_map_fd = bpf_obj_get("/sys/fs/bpf/webrtc_port_map");
 	if (bpf_map_fd >= 0) {
 		if (bpf_map_delete_elem(bpf_map_fd, &port) == 0) {
-			JLOG_DEBUG("PurpleRed: Removed port %hu from eBPF map", port);
+			JLOG_INFO("PurpleRed: Removed port %hu from eBPF map", port);
 		}
 
 		JLOG_ERROR("PurpleRed: Failed to remove port %hu from eBPF map, errno=%d", port, errno);
