@@ -58,6 +58,7 @@ set(LIBJUICE_SOURCES
 	${CMAKE_CURRENT_SOURCE_DIR}/src/timestamp.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/turn.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/udp.c
+	${CMAKE_CURRENT_SOURCE_DIR}/src/xsk.c
 )
 source_group("Source Files" FILES "${LIBJUICE_SOURCES}")
 
@@ -253,9 +254,18 @@ if(FUZZER)
 endif()
 
 if(USE_XDP)
-    target_compile_definitions(juice PRIVATE USE_XDP=1)
-    target_compile_definitions(juice-static PRIVATE USE_XDP=1)
+	if(NOT DEFINED XDP_IFNAME)
+		set(XDP_IFNAME "eth0" CACHE STRING "Network interface for XDP")
+	endif()
+    target_compile_definitions(juice PRIVATE USE_XDP=1 XDP_IFNAME=\"${XDP_IFNAME}\")
+    target_compile_definitions(juice-static PRIVATE USE_XDP=1 XDP_IFNAME=\"${XDP_IFNAME}\")
 	find_library(LIBBPF_LIBRARY NAMES bpf)
 	target_link_libraries(juice PRIVATE ${LIBBPF_LIBRARY})
     target_link_libraries(juice-static PRIVATE ${LIBBPF_LIBRARY})
+	find_library(LIBXDP_LIBRARY NAMES xdp)
+	target_link_libraries(juice PRIVATE ${LIBXDP_LIBRARY})
+    target_link_libraries(juice-static PRIVATE ${LIBXDP_LIBRARY})
+else()
+    target_compile_definitions(juice PRIVATE USE_XDP=0)
+    target_compile_definitions(juice-static PRIVATE USE_XDP=0)
 endif()

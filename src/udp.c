@@ -18,6 +18,7 @@
 #include <time.h>
 
 #if USE_XDP
+#include "xsk.h"
 #include <bpf/bpf.h>
 #endif
 
@@ -162,6 +163,9 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 
 	const int families[2] = {AF_INET6, AF_INET}; // Prefer IPv6
 	const char *names[2] = {"IPv6", "IPv4"};
+#if USE_XDP
+	static bool xsk_initialized = false;
+#endif
 	for (int i = 0; i < 2; ++i) {
 		const struct addrinfo *ai = find_family(ai_list, families[i]);
 		if (!ai)
@@ -172,21 +176,16 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 		if (sock != INVALID_SOCKET) {
 			freeaddrinfo(ai_list);
 #if USE_XDP
-			uint16_t port = udp_get_port(sock);
-			uint8_t value = 1;
-			int bpf_map_fd = bpf_obj_get("/sys/fs/bpf/webrtc_port_map");
-			if (bpf_map_fd >= 0) {
-				if (bpf_map_update_elem(bpf_map_fd, &port, &value, BPF_ANY) == 0) {
-					JLOG_INFO("PurpleRed: Added port %hu to eBPF map", port);
-					return sock;
-				}
-
-				JLOG_ERROR("PurpleRed: Failed to update eBPF map with port %hu, errno=%d", port,
-				           errno);
-			} else {
-				JLOG_ERROR("PurpleRed: Failed to get eBPF map");
+			if (add_port_to_ebpf_map(sock))
+				return INVALID_SOCKET;
+			if (!xsk_initialized) {
+				if (initialize_xsk())
+					return INVALID_SOCKET;
+				else
+					xsk_initialized = true;
 			}
 #endif
+			return sock;
 		}
 	}
 
@@ -619,19 +618,3 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 
 	return ret;
 }
-
-#if USE_XDP
-void remove_port_from_ebpf_map(socket_t sock) {
-	uint16_t port = udp_get_port(sock);
-	int bpf_map_fd = bpf_obj_get("/sys/fs/bpf/webrtc_port_map");
-	if (bpf_map_fd >= 0) {
-		if (bpf_map_delete_elem(bpf_map_fd, &port) == 0) {
-			JLOG_INFO("PurpleRed: Removed port %hu from eBPF map", port);
-		}
-
-		JLOG_ERROR("PurpleRed: Failed to remove port %hu from eBPF map, errno=%d", port, errno);
-	} else {
-		JLOG_ERROR("PurpleRed: Failed to get eBPF map");
-	}
-}
-#endif

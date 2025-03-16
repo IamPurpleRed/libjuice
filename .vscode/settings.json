@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "assert.h": "c",
+        "thread.h": "c",
+        "bpf.h": "c",
+        "udp.h": "c"
+    }
+}

@@ -12,6 +12,9 @@
 #include "socket.h"
 #include "thread.h"
 #include "udp.h"
+#if USE_XDP
+#include "xsk.h"
+#endif
 
 #include <assert.h>
 #include <string.h>
