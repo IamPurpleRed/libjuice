@@ -20,18 +20,18 @@ int initialize_xsk() {
 	if (juice_xsk)
 		return 0; // 已初始化
 
+	juice_xsk = calloc(1, sizeof(xsk_socket_info_t));
+	if (!juice_xsk) {
+		JLOG_FATAL("PurpleRed: Memory allocation for juice_xsk failed");
+		return -1;
+	}
+
 	int bpf_map_fd = bpf_obj_get("/sys/fs/bpf/wss_map");
 	if (bpf_map_fd < 0) {
 		JLOG_FATAL("PurpleRed: Failed to get eBPF map");
 		return -1;
 	}
 	juice_xsk->bpf_map_fd = bpf_map_fd;
-
-	juice_xsk = calloc(1, sizeof(xsk_socket_info_t));
-	if (!juice_xsk) {
-		JLOG_FATAL("PurpleRed: Memory allocation for juice_xsk failed");
-		return -1;
-	}
 
 	int ifindex = if_nametoindex(XDP_IFNAME);
 	if (ifindex == 0) {
