@@ -8,13 +8,15 @@
 
 typedef struct xsk_socket_info {
 	void *umem_area;
+
+	struct xsk_umem *umem;
 	struct xsk_ring_prod fill; // 寫入空的 frame descriptor -> producer
 	struct xsk_ring_cons comp;
 
 	struct xsk_socket *xsk;
-	int xsk_fd;
 	struct xsk_ring_cons rx; // 讀取 frame descriptor 以獲得封包 -> consumer
 	struct xsk_ring_prod tx;
+	int xsk_fd;
 } xsk_socket_info_t;
 
 int initialize_xsk();

@@ -15,40 +15,43 @@ int initialize_xsk() {
 
 	juice_xsk = calloc(1, sizeof(xsk_socket_info_t));
 	if (!juice_xsk) {
-		JLOG_FATAL("PurpleRed: Memory allocation for XSK failed");
+		JLOG_FATAL("PurpleRed: Memory allocation for juice_xsk failed");
 		return -1;
 	}
 
 	int ifindex = if_nametoindex(XDP_IFNAME);
 	if (ifindex == 0) {
 		JLOG_FATAL("PurpleRed: XDP_IFNAME not found");
-		goto error;
+		free_xsk_resources(0);
+		return -1;
 	}
 
 	// INFO: 在 user space 分配 4096 * 4096 Byte 的空間
 	void *umem_area = mmap(NULL, 4096 * 4096, PROT_READ | PROT_WRITE,
-	                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+	                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
 	if (umem_area == MAP_FAILED) {
-		JLOG_FATAL("PurpleRed: mmap creation failed");
-		goto error;
+		JLOG_FATAL("PurpleRed: Memory allocation for umem_area failed");
+		free_xsk_resources(0);
+		return -1;
 	}
 	juice_xsk->umem_area = umem_area;
 
 	// INFO: 在 umem_juice 建立 fill ring & completion ring
-	struct xsk_umem_config umem_cfg;
-	memset(&umem_cfg, 0, sizeof(umem_cfg));
-	umem_cfg.fill_size = 4096;                     // fill ring
-	umem_cfg.comp_size = 2048;                     // completion ring
-	umem_cfg.frame_size = 2048;                    // UMEM frame size
-	umem_cfg.frame_headroom = XDP_PACKET_HEADROOM; // extra space for each UMEM frame
-	struct xsk_umem *umem_xsk = NULL;
+	struct xsk_umem_config xsk_umem_cfg;
+	memset(&xsk_umem_cfg, 0, sizeof(xsk_umem_cfg));
+	xsk_umem_cfg.fill_size = 4096;                     // fill ring
+	xsk_umem_cfg.comp_size = 2048;                     // completion ring
+	xsk_umem_cfg.frame_size = 2048;                    // UMEM frame size
+	xsk_umem_cfg.frame_headroom = XDP_PACKET_HEADROOM; // extra space for each UMEM frame
+	struct xsk_umem *umem = NULL;
 	struct xsk_ring_prod fill;
 	struct xsk_ring_cons comp;
-	if (xsk_umem__create(&umem_xsk, umem_area, 4096 * 4096, &fill, &comp,
-	                     &umem_cfg)) {
-		JLOG_FATAL("PurpleRed: XSK access umem_juice failed");
-		goto error_map;
+	if (xsk_umem__create(&umem, umem_area, 4096 * 4096, &fill, &comp, &xsk_umem_cfg)) {
+		JLOG_FATAL("PurpleRed: XSK access umem_area failed");
+		free_xsk_resources(1);
+		return -1;
 	}
+	juice_xsk->umem = umem;
 	juice_xsk->fill = fill;
 	juice_xsk->comp = comp;
 
@@ -60,24 +63,34 @@ int initialize_xsk() {
 	xsk_cfg.tx_size = 2048; // TX ring
 	xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 	xsk_cfg.bind_flags = XDP_USE_NEED_WAKEUP;
-	if (xsk_socket__create(&(juice_xsk->xsk), XDP_IFNAME, 0, umem_xsk, &(juice_xsk->rx),
-	                       &(juice_xsk->tx), &xsk_cfg)) {
+	struct xsk_socket *xsk;
+	struct xsk_ring_cons rx;
+	struct xsk_ring_prod tx;
+	if (xsk_socket__create(&xsk, XDP_IFNAME, 0, umem, &rx, &tx, &xsk_cfg)) {
 		JLOG_FATAL("PurpleRed: XSK creation failed");
-		goto error_xsk;
+		free_xsk_resources(2);
+		return -1;
 	}
-
-	juice_xsk->xsk_fd = xsk_socket__fd(juice_xsk->xsk);
+	juice_xsk->xsk = xsk;
+	juice_xsk->rx = rx;
+	juice_xsk->tx = tx;
+	juice_xsk->xsk_fd = xsk_socket__fd(xsk);
 
 	return 0;
+}
 
-error_xsk:
-	xsk_umem__delete(umem_xsk);
-error_map:
-	munmap(umem_area, 4096 * 4096);
-error:
-	free(juice_xsk);
-	juice_xsk = NULL;
-	return -1;
+void free_xsk_resources(int option) {
+	switch (option) {
+	case 3:
+		xsk_socket__delete(juice_xsk->xsk);
+	case 2:
+		xsk_umem__delete(juice_xsk->umem);
+	case 1:
+		munmap(juice_xsk->umem_area, 4096 * 4096);
+	case 0:
+		free(juice_xsk);
+		juice_xsk = NULL;
+	}
 }
 
 int add_port_to_ebpf_map(socket_t sock) {
