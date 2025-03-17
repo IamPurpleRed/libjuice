@@ -4,6 +4,13 @@
 #include "log.h"
 
 #include <bpf/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/udp.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <socket.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 
@@ -12,6 +19,13 @@ static xsk_socket_info_t *juice_xsk = NULL;
 int initialize_xsk() {
 	if (juice_xsk)
 		return 0; // 已初始化
+
+	int bpf_map_fd = bpf_obj_get("/sys/fs/bpf/wss_map");
+	if (bpf_map_fd < 0) {
+		JLOG_FATAL("PurpleRed: Failed to get eBPF map");
+		return -1;
+	}
+	juice_xsk->bpf_map_fd = bpf_map_fd;
 
 	juice_xsk = calloc(1, sizeof(xsk_socket_info_t));
 	if (!juice_xsk) {
@@ -76,7 +90,96 @@ int initialize_xsk() {
 	juice_xsk->tx = tx;
 	juice_xsk->xsk_fd = xsk_socket__fd(xsk);
 
+	// INFO: 建立一個 thread，專門接收來自 XSK 的封包
+	pthread_t tid;
+	pthread_create(&tid, NULL, xsk_receive_loop, NULL);
+	pthread_detach(tid); // 不必讓其它執行緒呼叫 join
+
 	return 0;
+}
+
+// INFO: pthread function
+// TODO: 目前為 busy waiting，可改為 sleep waiting 或 polling
+void *xsk_receive_loop(void *arg) {
+	while (juice_xsk) {
+		receive_xsk_packets(juice_packet_handler);
+	}
+
+	return NULL;
+}
+
+int receive_xsk_packets(void (*packet_handler)(void *packet, int packet_len)) {
+
+	if (!juice_xsk) {
+		JLOG_FATAL("PurpleRed: juice_xsk is not exist");
+		return -1;
+	}
+
+	// INFO: 查看 RX ring (rx) 目前有幾個 UMEM frame descriptor 可接收，從哪裡開始接收
+	// TODO: 可調整參數，目前一次最多允許接收 64 個
+	unsigned int idx = 0;
+	int sum = xsk_ring_cons__peek(&juice_xsk->rx, 64, &idx); // 這次收到的封包數量
+	if (!sum)
+		return 0;
+
+	// INFO: 從 rx[idx] 開始取 descriptor (desc)，再從 umem_area 取封包內容，重複 sum 次
+	for (int i = 0; i < sum; i++) {
+		const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&juice_xsk->rx, idx++);
+		void *packet = xsk_umem__get_data(juice_xsk->umem_area, desc->addr);
+		packet_handler(packet, desc->len);
+	}
+
+	xsk_ring_cons__release(&juice_xsk->rx, sum);
+	return sum;
+}
+
+// INFO: receive_xsk_packets() 每收到一個封包，就會呼叫此函式一次，用來拆解 L2~L4 層
+void juice_packet_handler(void *packet, int packet_len) {
+	// 以下跟 XDP 程式邏輯幾乎一樣
+	struct ethhdr *eth = packet;
+	uint16_t eth_proto = ntohs(eth->h_proto);
+	struct udphdr *udph;
+	if (eth_proto == ETH_P_IP) {
+		struct iphdr *ip4h = (void *)(eth + 1);
+		udph = (void *)((__u8 *)ip4h + (ip4h->ihl * 4));
+	} else if (eth_proto == ETH_P_IPV6) {
+		struct ipv6hdr *ip6h = (void *)(eth + 1);
+		udph = (void *)(ip6h + 1);
+	}
+	uint16_t port = ntohs(udph->dest); // 取得 UDP destination port
+	// end
+
+	socket_t sock;
+	bpf_map_lookup_elem(juice_xsk->bpf_map_fd, &port, &sock);
+	struct sockaddr_storage addr;
+	socklen_t addrlen;
+	getsockname(sock, (struct sockaddr *)&addr, &addrlen); // 查詢 sock 綁定的位址，並寫入 addr
+	sendto(sock, (void *)(udph + 1), packet + packet_len - (void *)(udph + 1), 0,
+	       (struct sockaddr *)&addr, addrlen);
+}
+
+int add_to_ebpf_map(socket_t sock) {
+	uint16_t port = udp_get_port(sock);
+	int bpf_map_fd = juice_xsk->bpf_map_fd;
+	// INFO: key 是 port number，value 是 socket file descriptor
+	if (bpf_map_update_elem(bpf_map_fd, &port, &sock, BPF_ANY) == 0) {
+		JLOG_INFO("PurpleRed: Added socket (fd = %d, port = %hu) to eBPF map", sock, port);
+		return 0;
+	}
+
+	JLOG_ERROR("PurpleRed: Failed to update eBPF map with port %hu", port);
+
+	return -1;
+}
+
+void remove_port_from_ebpf_map(socket_t sock) {
+	uint16_t port = udp_get_port(sock);
+	int bpf_map_fd = juice_xsk->bpf_map_fd;
+	if (bpf_map_delete_elem(bpf_map_fd, &port) == 0) {
+		JLOG_INFO("PurpleRed: Removed port %hu from eBPF map", port);
+	}
+
+	JLOG_WARN("PurpleRed: Failed to remove port %hu from eBPF map, errno=%d", port, errno);
 }
 
 void free_xsk_resources(int option) {
@@ -88,39 +191,9 @@ void free_xsk_resources(int option) {
 	case 1:
 		munmap(juice_xsk->umem_area, 4096 * 4096);
 	case 0:
+	default:
 		free(juice_xsk);
 		juice_xsk = NULL;
-	}
-}
-
-int add_port_to_ebpf_map(socket_t sock) {
-	uint16_t port = udp_get_port(sock);
-	int bpf_map_fd = bpf_obj_get("/sys/fs/bpf/wss_map");
-	if (bpf_map_fd >= 0) {
-		if (bpf_map_update_elem(bpf_map_fd, &port, &sock, BPF_ANY) == 0) {
-			JLOG_INFO("PurpleRed: Added socket (fd = %d, port = %hu) to eBPF map", sock, port);
-			return 0;
-		}
-
-		JLOG_ERROR("PurpleRed: Failed to update eBPF map with port %hu", port);
-	} else {
-		JLOG_ERROR("PurpleRed: Failed to get eBPF map");
-	}
-
-	return -1;
-}
-
-void remove_port_from_ebpf_map(socket_t sock) {
-	uint16_t port = udp_get_port(sock);
-	int bpf_map_fd = bpf_obj_get("/sys/fs/bpf/webrtc_port_map");
-	if (bpf_map_fd >= 0) {
-		if (bpf_map_delete_elem(bpf_map_fd, &port) == 0) {
-			JLOG_INFO("PurpleRed: Removed port %hu from eBPF map", port);
-		}
-
-		JLOG_ERROR("PurpleRed: Failed to remove port %hu from eBPF map, errno=%d", port, errno);
-	} else {
-		JLOG_ERROR("PurpleRed: Failed to get eBPF map");
 	}
 }
 

@@ -3,6 +3,7 @@
         "assert.h": "c",
         "thread.h": "c",
         "bpf.h": "c",
-        "udp.h": "c"
+        "udp.h": "c",
+        "libbpf.h": "c"
     }
 }

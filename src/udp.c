@@ -176,14 +176,14 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 		if (sock != INVALID_SOCKET) {
 			freeaddrinfo(ai_list);
 #if USE_XDP
-			if (add_port_to_ebpf_map(sock))
-				return INVALID_SOCKET;
 			if (!xsk_initialized) {
 				if (initialize_xsk())
 					return INVALID_SOCKET;
 				else
 					xsk_initialized = true;
 			}
+			if (add_to_ebpf_map(sock))
+				return INVALID_SOCKET;
 #endif
 			return sock;
 		}
