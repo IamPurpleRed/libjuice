@@ -7,7 +7,8 @@
 #include <xdp/xsk.h>
 
 typedef struct xsk_socket_info {
-	int bpf_map_fd;
+	uint32_t wss_map_fd;
+	uint32_t xsk_map_fd;
 
 	void *umem_area;
 
@@ -25,8 +26,8 @@ int initialize_xsk();
 void *xsk_receive_loop(void *arg);
 int receive_xsk_packets(void (*packet_handler)(void *packet, int packet_len));
 void juice_packet_handler(void *packet, int packet_len);
-int add_to_ebpf_map(socket_t sock);
-void remove_port_from_ebpf_map(socket_t sock);
+int add_to_wss_map(socket_t sock);
+void remove_from_wss_map(socket_t sock);
 void free_xsk_resources(int option);
 
 #endif

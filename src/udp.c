@@ -182,7 +182,7 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 				else
 					xsk_initialized = true;
 			}
-			if (add_to_ebpf_map(sock))
+			if (add_to_wss_map(sock))
 				return INVALID_SOCKET;
 #endif
 			return sock;

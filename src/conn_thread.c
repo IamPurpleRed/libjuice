@@ -206,7 +206,7 @@ void conn_thread_cleanup(juice_agent_t *agent) {
 	thread_join(conn_impl->thread, NULL);
 
 #if USE_XDP
-	remove_port_from_ebpf_map(conn_impl->sock);
+	remove_from_wss_map(conn_impl->sock);
 #endif
 	closesocket(conn_impl->sock);
 	mutex_destroy(&conn_impl->mutex);

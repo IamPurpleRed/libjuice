@@ -87,7 +87,7 @@ static void delete_allocation(server_turn_alloc_t *alloc) {
 	alloc->state = SERVER_TURN_ALLOC_DELETED;
 	turn_destroy_map(&alloc->map);
 #if USE_XDP
-	remove_port_from_ebpf_map(alloc->sock);
+	remove_from_wss_map(alloc->sock);
 #endif
 	closesocket(alloc->sock);
 	alloc->sock = INVALID_SOCKET;
@@ -215,7 +215,7 @@ void server_do_destroy(juice_server_t *server) {
 	JLOG_DEBUG("Destroying server");
 
 #if USE_XDP
-	remove_port_from_ebpf_map(server->sock);
+	remove_from_wss_map(server->sock);
 #endif
 	closesocket(server->sock);
 	mutex_destroy(&server->mutex);
@@ -904,7 +904,7 @@ int server_process_turn_allocate(juice_server_t *server, const stun_message_t *m
 		}
 		if (turn_init_map(&alloc->map, server->config.max_peers) < 0) {
 #if USE_XDP
-			remove_port_from_ebpf_map(alloc->sock);
+			remove_from_wss_map(alloc->sock);
 #endif
 			closesocket(alloc->sock);
 			alloc->sock = INVALID_SOCKET;

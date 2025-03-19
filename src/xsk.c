@@ -26,12 +26,21 @@ int initialize_xsk() {
 		return -1;
 	}
 
-	int bpf_map_fd = bpf_obj_get("/sys/fs/bpf/wss_map");
-	if (bpf_map_fd < 0) {
-		JLOG_FATAL("PurpleRed: Failed to get eBPF map");
+	// INFO: 尋找 wss_map 的 file descriptor
+	uint32_t wss_map_fd = bpf_obj_get("/sys/fs/bpf/wss_map");
+	if (wss_map_fd < 0) {
+		JLOG_FATAL("PurpleRed: Failed to get wss_map");
 		return -1;
 	}
-	juice_xsk->bpf_map_fd = bpf_map_fd;
+	juice_xsk->wss_map_fd = wss_map_fd;
+
+	// INFO: 尋找 xsk_map 的 file descriptor
+	uint32_t xsk_map_fd = bpf_obj_get("/sys/fs/bpf/xsk_map");
+	if (xsk_map_fd < 0) {
+		JLOG_FATAL("PurpleRed: Failed to get xsk_map");
+		return -1;
+	}
+	juice_xsk->xsk_map_fd = xsk_map_fd;
 
 	int ifindex = if_nametoindex(XDP_IFNAME);
 	if (ifindex == 0) {
@@ -90,6 +99,15 @@ int initialize_xsk() {
 	juice_xsk->tx = tx;
 	juice_xsk->xsk_fd = xsk_socket__fd(xsk);
 
+	// INFO: 將 queue_id 和 xsk 更新至 xsk_map
+	// TODO: 支援多個 queue 的網卡
+	uint32_t queue_id = 0;
+	if (bpf_map_update_elem(xsk_map_fd, &queue_id, &(juice_xsk->xsk_fd), 0) != 0) {
+		JLOG_FATAL("Failed to bind XSK fd to xsk_map");
+		return -1;
+	}
+	JLOG_INFO("PurpleRed: Added %s queue 0 & XSK fd %d to xsk_map", XDP_IFNAME, juice_xsk->xsk_fd);
+
 	// INFO: 建立一個 thread，專門接收來自 XSK 的封包
 	pthread_t tid;
 	pthread_create(&tid, NULL, xsk_receive_loop, NULL);
@@ -119,8 +137,7 @@ int receive_xsk_packets(void (*packet_handler)(void *packet, int packet_len)) {
 	// TODO: 可調整參數，目前一次最多允許接收 64 個
 	unsigned int idx = 0;
 	int sum = xsk_ring_cons__peek(&juice_xsk->rx, 64, &idx); // 這次收到的封包數量
-	if (!sum)
-		return 0;
+	if (!sum) return 0;
 
 	// INFO: 從 rx[idx] 開始取 descriptor (desc)，再從 umem_area 取封包內容，重複 sum 次
 	for (int i = 0; i < sum; i++) {
@@ -150,7 +167,7 @@ void juice_packet_handler(void *packet, int packet_len) {
 	// end
 
 	socket_t sock;
-	bpf_map_lookup_elem(juice_xsk->bpf_map_fd, &port, &sock);
+	bpf_map_lookup_elem(juice_xsk->wss_map_fd, &port, &sock);
 	struct sockaddr_storage addr;
 	socklen_t addrlen;
 	getsockname(sock, (struct sockaddr *)&addr, &addrlen); // 查詢 sock 綁定的位址，並寫入 addr
@@ -158,9 +175,9 @@ void juice_packet_handler(void *packet, int packet_len) {
 	       (struct sockaddr *)&addr, addrlen);
 }
 
-int add_to_ebpf_map(socket_t sock) {
+int add_to_wss_map(socket_t sock) {
 	uint16_t port = udp_get_port(sock);
-	int bpf_map_fd = juice_xsk->bpf_map_fd;
+	int bpf_map_fd = juice_xsk->wss_map_fd;
 	// INFO: key 是 port number，value 是 socket file descriptor
 	if (bpf_map_update_elem(bpf_map_fd, &port, &sock, BPF_ANY) == 0) {
 		JLOG_INFO("PurpleRed: Added socket (fd = %d, port = %hu) to eBPF map", sock, port);
@@ -172,9 +189,9 @@ int add_to_ebpf_map(socket_t sock) {
 	return -1;
 }
 
-void remove_port_from_ebpf_map(socket_t sock) {
+void remove_from_wss_map(socket_t sock) {
 	uint16_t port = udp_get_port(sock);
-	int bpf_map_fd = juice_xsk->bpf_map_fd;
+	int bpf_map_fd = juice_xsk->wss_map_fd;
 	if (bpf_map_delete_elem(bpf_map_fd, &port) == 0) {
 		JLOG_INFO("PurpleRed: Removed port %hu from eBPF map", port);
 	}
