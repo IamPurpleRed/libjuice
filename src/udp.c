@@ -19,7 +19,6 @@
 
 #if USE_XDP
 #include "xsk.h"
-#include <bpf/bpf.h>
 #endif
 
 static struct addrinfo *find_family(struct addrinfo *ai_list, int family) {

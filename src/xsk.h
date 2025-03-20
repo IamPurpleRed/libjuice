@@ -20,12 +20,24 @@ typedef struct xsk_socket_info {
 	struct xsk_ring_cons rx; // 讀取 frame descriptor 以獲得封包 -> consumer
 	struct xsk_ring_prod tx;
 	int xsk_fd;
+
+	int cnt;  // test
 } xsk_socket_info_t;
+
+typedef struct wss_value {
+	__u32 socket_fd;
+	__u32 port;
+	__u8 ip_version;
+	union {
+		__u32 ipv4;
+		__u8 ipv6[16];
+	};
+} wss_value_t;
 
 int initialize_xsk();
 void *xsk_receive_loop(void *arg);
 int receive_xsk_packets(void (*packet_handler)(void *packet, int packet_len));
-void juice_packet_handler(void *packet, int packet_len);
+void packet_handler(void *packet, int packet_len);
 int add_to_wss_map(socket_t sock);
 void remove_from_wss_map(socket_t sock);
 void free_xsk_resources(int option);
