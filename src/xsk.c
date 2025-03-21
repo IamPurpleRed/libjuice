@@ -163,14 +163,14 @@ void prime_fill_ring(struct xsk_ring_prod *fill) {
 // INFO: pthread function (busy waiting)
 void *xsk_receive_loop(void *arg) {
 	while (juice_xsk) {
-		receive_xsk_packets(packet_handler);
+		receive_xsk_packets();
 	}
 
 	return NULL;
 }
 
 
-int receive_xsk_packets(void (*packet_handler)(void *packet, int packet_len)) {
+int receive_xsk_packets() {
 	if (!juice_xsk) {
 		JLOG_FATAL("PurpleRed: juice_xsk is not exist");
 		return -1;
@@ -180,6 +180,7 @@ int receive_xsk_packets(void (*packet_handler)(void *packet, int packet_len)) {
 	unsigned int idx = 0;
 	int sum = xsk_ring_cons__peek(&juice_xsk->rx, 64, &idx); // 這次收到的封包數量
 	if (!sum) return 0;
+	JLOG_INFO("PurpleRed: Received %d packets", sum);
 
 	// INFO: 從 rx[idx] 開始取 descriptor (desc)，再從 umem_area 取封包內容，重複 sum 次
 	for (int i = 0; i < sum; i++) {
@@ -219,6 +220,8 @@ int receive_xsk_packets(void (*packet_handler)(void *packet, int packet_len)) {
 
 // INFO: receive_xsk_packets() 每收到一個封包，就會呼叫此函式一次，用來拆解 L2~L4 層
 void packet_handler(void *packet, int packet_len) {
+	wss_value_t value;
+	memset(&value, 0, sizeof(value));
 	// 以下跟 XDP 程式邏輯幾乎一樣
 	struct ethhdr *eth = packet;
 	uint16_t eth_proto = ntohs(eth->h_proto);
@@ -226,43 +229,44 @@ void packet_handler(void *packet, int packet_len) {
 	if (eth_proto == ETH_P_IP) {
 		struct iphdr *ip4h = (void *)(eth + 1);
 		udph = (void *)((__u8 *)ip4h + (ip4h->ihl * 4));
-		// struct sockaddr_in *sa4 = (struct sockaddr_in *)&(src->addr);
-		// memset(sa4, 0, sizeof(*sa4));
-		// sa4->sin_family = AF_INET;
-		// sa4->sin_addr.s_addr = ip4h->saddr;
-		// sa4->sin_port = udph->source;
-		// src->len = sizeof(*sa4);
+		value.ip_version = 4;
+		value.src_ipv4 = ip4h->saddr;
 	} else if (eth_proto == ETH_P_IPV6) {
 		struct ipv6hdr *ip6h = (void *)(eth + 1);
 		udph = (void *)(ip6h + 1);
-		// struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&(src->addr);
-		// memset(sa6, 0, sizeof(*sa6));
-		// sa6->sin6_family = AF_INET6;
-		// sa6->sin6_addr = ip6h->saddr;
-		// sa6->sin6_port = udph->source;
-		// src->len = sizeof(*sa6);
+		value.ip_version = 6;
+		memcpy(&(value.src_ipv6), &(ip6h->saddr), 16);
 	}
-	uint16_t port = ntohs(udph->dest); // 取得 UDP destination port
+	value.src_port = ntohs(udph->source);  // src port
+	uint16_t dest_port = ntohs(udph->dest); // dest port
 	// end
 
-	// TODO: 使用 UNIX domain socket
-	socket_t sock;
-	bpf_map_lookup_elem(juice_xsk->wss_map_fd, &port, &sock);
+	// INFO: 判斷是否要更新 wss_map[dest]（包含 src IP & port）
+	wss_value_t old_value;
+	bpf_map_lookup_elem(juice_xsk->wss_map_fd, &dest_port, &old_value);
+	value.socket_fd = old_value.socket_fd; // 從 old_value 取出 socket fd
+	if (old_value.ip_version == 0) {
+		bpf_map_update_elem(juice_xsk->wss_map_fd, &dest_port, &value, BPF_ANY);  // 寫入 value，覆寫 old_value
+	}
+
+	// INFO: 自己傳給自己（笨方法）
 	struct sockaddr_storage addr;
 	socklen_t addrlen;
-	getsockname(sock, (struct sockaddr *)&addr, &addrlen); // 查詢 sock 綁定的位址，並寫入 addr
-	sendto(sock, (void *)(udph + 1), packet + packet_len - (void *)(udph + 1), 0,
+	getsockname(value.socket_fd, (struct sockaddr *)&addr, &addrlen); // 查詢 sock 綁定的位址，並寫入 addr
+	sendto(value.socket_fd, (void *)(udph + 1), packet + packet_len - (void *)(udph + 1), 0,
 	       (struct sockaddr *)&addr, addrlen);
 }
 
 
-int add_to_wss_map(socket_t sock) {
+// INFO: 寫入新的 port 和 socket fd 至 wss_map（不含 src IP & port）
+int add_port_to_wss_map(socket_t sock) {
 	uint16_t port = udp_get_port(sock);
 	wss_value_t value;
 	memset(&value, 0, sizeof(value));
 	value.socket_fd = sock;
 	if (bpf_map_update_elem(juice_xsk->wss_map_fd, &port, &value, BPF_ANY) == 0) {
-		JLOG_INFO("PurpleRed: XDP will handle all the packet to socket (fd = %d, port = %hu)", sock, port);
+		JLOG_INFO("PurpleRed: XDP will redirect all packets sent to port %hu to socket (fd = %d)",
+		          port, sock);
 		return 0;
 	}
 
@@ -282,6 +286,23 @@ void remove_from_wss_map(socket_t sock) {
 	JLOG_WARN("PurpleRed: Failed to remove port %hu from WSS_map", port);
 }
 
+void update_src_addr(socket_t sock, addr_record_t *src) {
+	uint16_t port = udp_get_port(sock);
+	wss_value_t value;
+	bpf_map_lookup_elem(juice_xsk->wss_map_fd, &port, &value);
+	if (value.ip_version == 4) {
+		struct sockaddr_in *addr4 = (struct sockaddr_in *)&(src->addr);
+		addr4->sin_family = AF_INET;
+		addr4->sin_port = htons(value.src_port); // 必須轉為 network byte order
+		addr4->sin_addr.s_addr = value.src_ipv4; // ipv4 已是 network byte order
+	} else if (value.ip_version == 6) {
+		struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&(src->addr);
+		addr6->sin6_family = AF_INET6;
+		addr6->sin6_port = htons(value.src_port);             // 必須轉為 network byte order
+		memcpy(addr6->sin6_addr.s6_addr, value.src_ipv6, 16); // ipv6 已是 network byte order
+	}
+	src->len = sizeof(src->addr);
+}
 
 void free_xsk_resources(int option) {
 	switch (option) {

@@ -289,6 +289,7 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 }
 
 int conn_poll_run(conn_registry_t *registry) {
+	JLOG_WARN("PurpleRed: conn_poll_run()");
 	pfds_record_t pfds;
 	pfds.pfds = NULL;
 	pfds.size = 0;

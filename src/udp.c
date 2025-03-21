@@ -181,7 +181,7 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 				else
 					xsk_initialized = true;
 			}
-			if (add_to_wss_map(sock))
+			if (add_port_to_wss_map(sock))
 				return INVALID_SOCKET;
 #endif
 			return sock;
@@ -194,10 +194,12 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 }
 
 int udp_recvfrom(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
+	JLOG_WARN("PurpleRed: udp_recvfrom()");
 	while (true) {
 		src->len = sizeof(src->addr);
 		int len =
 		    recvfrom(sock, buffer, (socklen_t)size, 0, (struct sockaddr *)&src->addr, &src->len);
+		update_src_addr(sock, src);
 		if (len >= 0) {
 			addr_unmap_inet6_v4mapped((struct sockaddr *)&src->addr, &src->len);
 

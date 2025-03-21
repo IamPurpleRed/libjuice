@@ -26,20 +26,22 @@ typedef struct xsk_socket_info {
 
 typedef struct wss_value {
 	__u32 socket_fd;
-	__u32 port;
 	__u8 ip_version;
 	union {
-		__u32 ipv4;
-		__u8 ipv6[16];
+		__u32 src_ipv4;
+		__u8 src_ipv6[16];
 	};
+	__u32 src_port;
 } wss_value_t;
 
 int initialize_xsk();
+void prime_fill_ring(struct xsk_ring_prod *fill);
 void *xsk_receive_loop(void *arg);
-int receive_xsk_packets(void (*packet_handler)(void *packet, int packet_len));
+int receive_xsk_packets();
 void packet_handler(void *packet, int packet_len);
-int add_to_wss_map(socket_t sock);
+int add_port_to_wss_map(socket_t sock);
 void remove_from_wss_map(socket_t sock);
+void update_src_addr(socket_t sock, addr_record_t *src);
 void free_xsk_resources(int option);
 
 #endif
