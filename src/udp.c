@@ -162,9 +162,6 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 
 	const int families[2] = {AF_INET6, AF_INET}; // Prefer IPv6
 	const char *names[2] = {"IPv6", "IPv4"};
-#if USE_XDP
-	static bool xsk_initialized = false;
-#endif
 	for (int i = 0; i < 2; ++i) {
 		const struct addrinfo *ai = find_family(ai_list, families[i]);
 		if (!ai)
@@ -174,16 +171,6 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 		socket_t sock = create_socket_for_addrinfo(config, ai);
 		if (sock != INVALID_SOCKET) {
 			freeaddrinfo(ai_list);
-#if USE_XDP
-			if (!xsk_initialized) {
-				if (initialize_xsk())
-					return INVALID_SOCKET;
-				else
-					xsk_initialized = true;
-			}
-			if (add_port_to_wss_map(sock))
-				return INVALID_SOCKET;
-#endif
 			return sock;
 		}
 	}
@@ -199,7 +186,6 @@ int udp_recvfrom(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
 		src->len = sizeof(src->addr);
 		int len =
 		    recvfrom(sock, buffer, (socklen_t)size, 0, (struct sockaddr *)&src->addr, &src->len);
-		update_src_addr(sock, src);
 		if (len >= 0) {
 			addr_unmap_inet6_v4mapped((struct sockaddr *)&src->addr, &src->len);
 

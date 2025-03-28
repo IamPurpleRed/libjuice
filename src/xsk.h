@@ -34,15 +34,15 @@ typedef struct wss_value {
 	__u32 src_port;
 } wss_value_t;
 
-int initialize_xsk();
+int initialize_xsk(xsk_socket_info_t **juice_xsk);
 void prime_fill_ring(struct xsk_ring_prod *fill);
 void *xsk_receive_loop(void *arg);
-int receive_xsk_packets();
-void packet_handler(void *packet, int packet_len);
-int add_port_to_wss_map(socket_t sock);
-void remove_from_wss_map(socket_t sock);
-void update_src_addr(socket_t sock, addr_record_t *src);
-void free_xsk_resources(int option);
+int receive_xsk_packets(xsk_socket_info_t *juice_xsk);
+void packet_handler(xsk_socket_info_t *juice_xsk, void *packet, int packet_len);
+int add_port_to_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk);
+void remove_from_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk);
+void update_src_addr(xsk_socket_info_t *juice_xsk, socket_t sock, addr_record_t *src);
+void free_xsk_resources(xsk_socket_info_t *juice_xsk, int option);
 
 #endif
 #endif

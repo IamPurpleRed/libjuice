@@ -18,6 +18,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#if USE_XDP
+#include "xsk.h"
+#endif
+
 typedef struct juice_agent juice_agent_t;
 
 // Generic connection interface for agents
@@ -30,6 +34,9 @@ typedef struct conn_registry {
 	juice_agent_t **agents;
 	int agents_size;
 	int agents_count;
+#if USE_XDP
+	xsk_socket_info_t *juice_xsk;
+#endif
 } conn_registry_t;
 
 typedef struct conn_mode_entry {

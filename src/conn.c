@@ -16,6 +16,10 @@
 #include <assert.h>
 #include <string.h>
 
+#if USE_XDP
+#include "xsk.h"
+#endif
+
 #define INITIAL_REGISTRY_SIZE 16
 
 #define MODE_ENTRIES_SIZE 3
@@ -91,6 +95,16 @@ static int acquire_registry(conn_mode_entry_t *entry, udp_socket_config_t *confi
 			free(registry);
 			return -1;
 		}
+
+#if USE_XDP
+		if (initialize_xsk(&(registry->juice_xsk))) {
+			mutex_unlock(&registry->mutex);
+			free(registry->impl);
+			free(registry->agents);
+			free(registry);
+			return -1;
+		}
+#endif
 
 		entry->registry = registry;
 	} else {

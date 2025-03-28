@@ -2,6 +2,7 @@
 
 #include "xsk.h"
 #include "log.h"
+#include "conn.h"
 
 #include <bpf/bpf.h>
 #include <linux/if_ether.h>
@@ -17,47 +18,42 @@
 #define FRAME_SIZE 2048
 #define FILL_RING_SIZE 4096
 
-static xsk_socket_info_t *juice_xsk = NULL;
 
-int initialize_xsk() {
-	if (juice_xsk)
+int initialize_xsk(xsk_socket_info_t **juice_xsk_ptr) {
+	if (*juice_xsk_ptr)
 		return 0; // 已初始化
 
-	juice_xsk = calloc(1, sizeof(xsk_socket_info_t));
-	if (!juice_xsk) {
+	*juice_xsk_ptr = calloc(1, sizeof(xsk_socket_info_t));
+	if (!juice_xsk_ptr) {
 		JLOG_FATAL("PurpleRed: Memory allocation for juice_xsk failed");
 		return -1;
 	}
+	xsk_socket_info_t *juice_xsk = *juice_xsk_ptr;
 
 	// INFO: 尋找 wss_map 的 file descriptor
 	int wss_map_fd = bpf_obj_get("/sys/fs/bpf/wss_map");
 	if (wss_map_fd < 0) {
 		JLOG_FATAL("PurpleRed: Failed to get wss_map");
+		free_xsk_resources(juice_xsk, 0);
 		return -1;
 	}
-	juice_xsk->wss_map_fd = wss_map_fd;
+	(juice_xsk)->wss_map_fd = wss_map_fd;
 
 	// INFO: 尋找 xsk_map 的 file descriptor
 	int xsk_map_fd = bpf_obj_get("/sys/fs/bpf/xsk_map");
 	if (xsk_map_fd < 0) {
 		JLOG_FATAL("PurpleRed: Failed to get xsk_map");
+		free_xsk_resources(juice_xsk, 0);
 		return -1;
 	}
 	juice_xsk->xsk_map_fd = xsk_map_fd;
-
-	// int ifindex = if_nametoindex(XDP_IFNAME);
-	// if (ifindex == 0) {
-	// 	JLOG_FATAL("PurpleRed: XDP_IFNAME not found");
-	// 	free_xsk_resources(0);
-	// 	return -1;
-	// }
 
 	// INFO: 在 user space 分配 4096 * 4096 Byte 的空間
 	void *umem_area = mmap(NULL, 4096 * 4096, PROT_READ | PROT_WRITE,
 	                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
 	if (umem_area == MAP_FAILED) {
 		JLOG_FATAL("PurpleRed: Memory allocation for umem_area failed");
-		free_xsk_resources(0);
+		free_xsk_resources(juice_xsk, 0);
 		return -1;
 	}
 	juice_xsk->umem_area = umem_area;
@@ -74,7 +70,7 @@ int initialize_xsk() {
 	struct xsk_ring_cons comp;
 	if (xsk_umem__create(&umem, umem_area, 4096 * 4096, &fill, &comp, &xsk_umem_cfg)) {
 		JLOG_FATAL("PurpleRed: XSK access umem_area failed");
-		free_xsk_resources(1);
+		free_xsk_resources(juice_xsk, 1);
 		return -1;
 	}
 	juice_xsk->umem = umem;
@@ -94,7 +90,7 @@ int initialize_xsk() {
 	struct xsk_ring_prod tx;
 	if (xsk_socket__create(&xsk, XDP_IFNAME, 0, umem, &rx, &tx, &xsk_cfg)) {
 		JLOG_FATAL("PurpleRed: XSK creation failed");
-		free_xsk_resources(2);
+		free_xsk_resources(juice_xsk, 2);
 		return -1;
 	}
 	juice_xsk->xsk = xsk;
@@ -107,7 +103,7 @@ int initialize_xsk() {
 	int queue_id = 0;
 	if (bpf_map_update_elem(xsk_map_fd, &queue_id, &(juice_xsk->xsk_fd), BPF_ANY) != 0) {
 		JLOG_FATAL("PurpleRed: Failed to bind XSK fd to xsk_map");
-		free_xsk_resources(3);
+		free_xsk_resources(juice_xsk, 3);
 		return -1;
 	}
 
@@ -116,7 +112,7 @@ int initialize_xsk() {
 
 	// INFO: 建立一個 thread，專門接收來自 XSK 的封包
 	pthread_t tid;
-	pthread_create(&tid, NULL, xsk_receive_loop, NULL);
+	pthread_create(&tid, NULL, xsk_receive_loop, (void *)juice_xsk);
 	pthread_detach(tid); // 不必讓其它執行緒呼叫 join
 
 	return 0;
@@ -162,15 +158,15 @@ void prime_fill_ring(struct xsk_ring_prod *fill) {
 
 // INFO: pthread function (busy waiting)
 void *xsk_receive_loop(void *arg) {
+	xsk_socket_info_t *juice_xsk = arg;
 	while (juice_xsk) {
-		receive_xsk_packets();
+		receive_xsk_packets(juice_xsk);
 	}
 
 	return NULL;
 }
 
-
-int receive_xsk_packets() {
+int receive_xsk_packets(xsk_socket_info_t *juice_xsk) {
 	if (!juice_xsk) {
 		JLOG_FATAL("PurpleRed: juice_xsk is not exist");
 		return -1;
@@ -186,13 +182,12 @@ int receive_xsk_packets() {
 	for (int i = 0; i < sum; i++) {
 		const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&juice_xsk->rx, idx++);
 		void *packet = xsk_umem__get_data(juice_xsk->umem_area, desc->addr);
-		packet_handler(packet, desc->len);
+		packet_handler(juice_xsk, packet, desc->len);
 	}
 
 	xsk_ring_cons__release(&juice_xsk->rx, sum);
 	return sum;
 }
-
 
 // INFO: 從 RX ring 取一個封包，回傳長度，若沒有則回傳 -1
 // FUTURE: 一次接收多個封包，目前 sum 非 0 即 1，等於原本的 recvfrom()
@@ -219,7 +214,7 @@ int receive_xsk_packets() {
 
 
 // INFO: receive_xsk_packets() 每收到一個封包，就會呼叫此函式一次，用來拆解 L2~L4 層
-void packet_handler(void *packet, int packet_len) {
+void packet_handler(xsk_socket_info_t *juice_xsk, void *packet, int packet_len) {
 	wss_value_t value;
 	memset(&value, 0, sizeof(value));
 	// 以下跟 XDP 程式邏輯幾乎一樣
@@ -257,9 +252,8 @@ void packet_handler(void *packet, int packet_len) {
 	       (struct sockaddr *)&addr, addrlen);
 }
 
-
 // INFO: 寫入新的 port 和 socket fd 至 wss_map（不含 src IP & port）
-int add_port_to_wss_map(socket_t sock) {
+int add_port_to_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk) {
 	uint16_t port = udp_get_port(sock);
 	wss_value_t value;
 	memset(&value, 0, sizeof(value));
@@ -276,7 +270,7 @@ int add_port_to_wss_map(socket_t sock) {
 }
 
 
-void remove_from_wss_map(socket_t sock) {
+void remove_from_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk) {
 	uint16_t port = udp_get_port(sock);
 	int wss_map_fd = juice_xsk->wss_map_fd;
 	if (bpf_map_delete_elem(wss_map_fd, &port) == 0) {
@@ -286,7 +280,7 @@ void remove_from_wss_map(socket_t sock) {
 	JLOG_WARN("PurpleRed: Failed to remove port %hu from WSS_map", port);
 }
 
-void update_src_addr(socket_t sock, addr_record_t *src) {
+void update_src_addr(xsk_socket_info_t *juice_xsk, socket_t sock, addr_record_t *src) {
 	uint16_t port = udp_get_port(sock);
 	wss_value_t value;
 	bpf_map_lookup_elem(juice_xsk->wss_map_fd, &port, &value);
@@ -304,7 +298,7 @@ void update_src_addr(socket_t sock, addr_record_t *src) {
 	src->len = sizeof(src->addr);
 }
 
-void free_xsk_resources(int option) {
+void free_xsk_resources(xsk_socket_info_t *juice_xsk, int option) {
 	switch (option) {
 	case 3:
 		xsk_socket__delete(juice_xsk->xsk);
@@ -315,7 +309,6 @@ void free_xsk_resources(int option) {
 	case 0:
 	default:
 		free(juice_xsk);
-		juice_xsk = NULL;
 	}
 }
 

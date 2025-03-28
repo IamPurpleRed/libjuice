@@ -278,9 +278,6 @@ int conn_mux_registry_init(conn_registry_t *registry, udp_socket_config_t *confi
 
 error:
 	mutex_destroy(&registry_impl->send_mutex);
-#if USE_XDP
-	remove_from_wss_map(registry_impl->sock);
-#endif
 	closesocket(registry_impl->sock);
 	free(registry_impl->map);
 	free(registry_impl);
@@ -305,9 +302,6 @@ void conn_mux_registry_cleanup(conn_registry_t *registry) {
 	--conn_mux_registries_count;
 
 	mutex_destroy(&registry_impl->send_mutex);
-#if USE_XDP
-	remove_from_wss_map(registry_impl->sock);
-#endif
 	closesocket(registry_impl->sock);
 	free(registry_impl->map);
 	free(registry->impl);

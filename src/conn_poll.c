@@ -126,9 +126,15 @@ void conn_poll_registry_cleanup(conn_registry_t *registry) {
 #endif
 	free(registry->impl);
 	registry->impl = NULL;
+
+#if USE_XDP
+	free_xsk_resources(registry->juice_xsk, 3);
+	registry->juice_xsk = NULL;
+#endif
 }
 
 int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_t *next_timestamp) {
+	JLOG_WARN("PurpleRed: conn_poll_prepare()");
 	timestamp_t now = current_timestamp();
 	*next_timestamp = now + 60000;
 
@@ -191,6 +197,7 @@ error:
 }
 
 int conn_poll_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
+	JLOG_WARN("PurpleRed: conn_poll_recv()");
 	JLOG_VERBOSE("Receiving datagram");
 	int len;
 	while ((len = udp_recvfrom(sock, buffer, size, src)) == 0) {
@@ -211,6 +218,7 @@ int conn_poll_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src)
 }
 
 int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
+	JLOG_WARN("PurpleRed: conn_poll_process()");
 	struct pollfd *interrupt_pfd = pfds->pfds;
 	if (interrupt_pfd->revents & POLLIN) {
 #ifdef _WIN32
@@ -255,6 +263,10 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 			int left = 1000; // limit for fairness between sockets
 			while (left-- &&
 			       (ret = conn_poll_recv(conn_impl->sock, buffer, BUFFER_SIZE, &src)) > 0) {
+#if USE_XDP
+				update_src_addr(registry->juice_xsk, conn_impl->sock, &src);
+#endif
+
 				if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
 					JLOG_WARN("Agent receive failed");
 					conn_impl->state = CONN_STATE_FINISHED;
@@ -327,6 +339,7 @@ int conn_poll_run(conn_registry_t *registry) {
 }
 
 int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_config_t *config) {
+	JLOG_WARN("PurpleRed: conn_poll_init()");
 	conn_impl_t *conn_impl = calloc(1, sizeof(conn_impl_t));
 	if (!conn_impl) {
 		JLOG_FATAL("Memory allocation failed for connection impl");
@@ -340,6 +353,13 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 		return -1;
 	}
 
+#if USE_XDP
+	if (add_port_to_wss_map(conn_impl->sock, registry->juice_xsk)) {
+		free(conn_impl);
+		return -1;
+	}
+#endif
+
 	mutex_init(&conn_impl->send_mutex, 0);
 	conn_impl->registry = registry;
 
@@ -348,13 +368,14 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 }
 
 void conn_poll_cleanup(juice_agent_t *agent) {
+	JLOG_WARN("PurpleRed: conn_poll_cleanup()");
 	conn_impl_t *conn_impl = agent->conn_impl;
 
 	conn_poll_interrupt(agent);
 
 	mutex_destroy(&conn_impl->send_mutex);
 #if USE_XDP
-	remove_from_wss_map(conn_impl->sock);
+	remove_from_wss_map(conn_impl->sock, agent->registry->juice_xsk);
 #endif
 	closesocket(conn_impl->sock);
 	free(agent->conn_impl);
@@ -362,18 +383,21 @@ void conn_poll_cleanup(juice_agent_t *agent) {
 }
 
 void conn_poll_lock(juice_agent_t *agent) {
+	JLOG_WARN("PurpleRed: conn_poll_lock()");
 	conn_impl_t *conn_impl = agent->conn_impl;
 	conn_registry_t *registry = conn_impl->registry;
 	mutex_lock(&registry->mutex);
 }
 
 void conn_poll_unlock(juice_agent_t *agent) {
+	JLOG_WARN("PurpleRed: conn_poll_unlock()");
 	conn_impl_t *conn_impl = agent->conn_impl;
 	conn_registry_t *registry = conn_impl->registry;
 	mutex_unlock(&registry->mutex);
 }
 
 int conn_poll_interrupt(juice_agent_t *agent) {
+	JLOG_WARN("PurpleRed: conn_poll_interrupt()");
 	conn_impl_t *conn_impl = agent->conn_impl;
 	conn_registry_t *registry = conn_impl->registry;
 	registry_impl_t *registry_impl = registry->impl;
@@ -403,6 +427,7 @@ int conn_poll_interrupt(juice_agent_t *agent) {
 
 int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
                    int ds) {
+	JLOG_WARN("PurpleRed: conn_poll_send()");
 	conn_impl_t *conn_impl = agent->conn_impl;
 
 	mutex_lock(&conn_impl->send_mutex);
@@ -433,6 +458,7 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 }
 
 int conn_poll_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size) {
+	JLOG_WARN("PurpleRed: conn_poll_addrs()");
 	conn_impl_t *conn_impl = agent->conn_impl;
 
 	return udp_get_addrs(conn_impl->sock, records, size);
