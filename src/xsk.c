@@ -110,11 +110,6 @@ int initialize_xsk(xsk_socket_info_t **juice_xsk_ptr) {
 	// INFO: 將可用的 UMEM frame index 放入 fill queue，讓 kernel 知道哪些 index 可以放置從 XSK 來的封包
 	prime_fill_ring(&(juice_xsk->fill));
 
-	// INFO: 建立一個 thread，專門接收來自 XSK 的封包
-	pthread_t tid;
-	pthread_create(&tid, NULL, xsk_receive_loop, (void *)juice_xsk);
-	pthread_detach(tid); // 不必讓其它執行緒呼叫 join
-
 	return 0;
 }
 
@@ -155,16 +150,6 @@ void prime_fill_ring(struct xsk_ring_prod *fill) {
 	// }
 }
 
-
-// INFO: pthread function (busy waiting)
-void *xsk_receive_loop(void *arg) {
-	xsk_socket_info_t *juice_xsk = arg;
-	while (juice_xsk) {
-		receive_xsk_packets(juice_xsk);
-	}
-
-	return NULL;
-}
 
 int receive_xsk_packets(xsk_socket_info_t *juice_xsk) {
 	if (!juice_xsk) {

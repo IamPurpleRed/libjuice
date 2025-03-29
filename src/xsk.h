@@ -36,7 +36,6 @@ typedef struct wss_value {
 
 int initialize_xsk(xsk_socket_info_t **juice_xsk);
 void prime_fill_ring(struct xsk_ring_prod *fill);
-void *xsk_receive_loop(void *arg);
 int receive_xsk_packets(xsk_socket_info_t *juice_xsk);
 void packet_handler(xsk_socket_info_t *juice_xsk, void *packet, int packet_len);
 int add_port_to_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk);

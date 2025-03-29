@@ -139,7 +139,11 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 	*next_timestamp = now + 60000;
 
 	mutex_lock(&registry->mutex);
+#if USE_XDP
+	nfds_t size = (nfds_t)(2 + registry->agents_size);
+#else
 	nfds_t size = (nfds_t)(1 + registry->agents_size);
+#endif
 	if (pfds->size != size) {
 		struct pollfd *new_pfds = realloc(pfds->pfds, sizeof(struct pollfd) * size);
 		if (!new_pfds) {
@@ -160,6 +164,38 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 #endif
 	interrupt_pfd->events = POLLIN;
 
+#if USE_XDP
+	struct pollfd *xsk_pfd = pfds->pfds + 1;
+	xsk_pfd->fd = registry->juice_xsk->xsk_fd;
+	xsk_pfd->events = POLLIN;
+
+	for (nfds_t i = 2; i < pfds->size; ++i) {
+		struct pollfd *pfd = pfds->pfds + i;
+		juice_agent_t *agent = registry->agents[i - 2];
+		if (!agent) {
+			pfd->fd = INVALID_SOCKET;
+			pfd->events = 0;
+			continue;
+		}
+
+		conn_impl_t *conn_impl = agent->conn_impl;
+		if (!conn_impl ||
+		    (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY)) {
+			pfd->fd = INVALID_SOCKET;
+			pfd->events = 0;
+			continue;
+		}
+
+		if (conn_impl->state == CONN_STATE_NEW)
+			conn_impl->state = CONN_STATE_READY;
+
+		if (*next_timestamp > conn_impl->next_timestamp)
+			*next_timestamp = conn_impl->next_timestamp;
+
+		pfd->fd = conn_impl->sock;
+		pfd->events = POLLIN;
+	}
+#else
 	for (nfds_t i = 1; i < pfds->size; ++i) {
 		struct pollfd *pfd = pfds->pfds + i;
 		juice_agent_t *agent = registry->agents[i - 1];
@@ -186,6 +222,7 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 		pfd->fd = conn_impl->sock;
 		pfd->events = POLLIN;
 	}
+#endif
 
 	int count = registry->agents_count;
 	mutex_unlock(&registry->mutex);
@@ -236,6 +273,72 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 	}
 
 	mutex_lock(&registry->mutex);
+#if USE_XDP
+	struct pollfd *xsk_pfd = pfds->pfds + 1;
+	if (xsk_pfd->revents & POLLIN) {
+		JLOG_WARN("PurpleRed: juice_xsk POLLIN");
+		receive_xsk_packets(registry->juice_xsk);
+	}
+
+	for (nfds_t i = 2; i < pfds->size; ++i) {
+		struct pollfd *pfd = pfds->pfds + i;
+		if (pfd->fd == INVALID_SOCKET)
+			continue;
+
+		juice_agent_t *agent = registry->agents[i - 2];
+		if (!agent)
+			continue;
+
+		conn_impl_t *conn_impl = agent->conn_impl;
+		if (!conn_impl || conn_impl->sock != pfd->fd || conn_impl->state != CONN_STATE_READY)
+			continue;
+
+		if (pfd->revents & POLLNVAL || pfd->revents & POLLERR) {
+			JLOG_WARN("Error when polling socket");
+			agent_conn_fail(agent);
+			conn_impl->state = CONN_STATE_FINISHED;
+			continue;
+		}
+
+		if (pfd->revents & POLLIN) {
+			char buffer[BUFFER_SIZE];
+			addr_record_t src;
+			int ret = 0;
+			int left = 1000; // limit for fairness between sockets
+			while (left-- &&
+			       (ret = conn_poll_recv(conn_impl->sock, buffer, BUFFER_SIZE, &src)) > 0) {
+				update_src_addr(registry->juice_xsk, conn_impl->sock, &src);
+				
+				if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
+					JLOG_WARN("Agent receive failed");
+					conn_impl->state = CONN_STATE_FINISHED;
+					break;
+				}
+			}
+			if (conn_impl->state == CONN_STATE_FINISHED)
+			continue;
+			
+			if (ret < 0) {
+				agent_conn_fail(agent);
+				conn_impl->state = CONN_STATE_FINISHED;
+				continue;
+			}
+			
+			if (agent_conn_update(agent, &conn_impl->next_timestamp) != 0) {
+				JLOG_WARN("Agent update failed");
+				conn_impl->state = CONN_STATE_FINISHED;
+				continue;
+			}
+			
+		} else if (conn_impl->next_timestamp <= current_timestamp()) {
+			if (agent_conn_update(agent, &conn_impl->next_timestamp) != 0) {
+				JLOG_WARN("Agent update failed");
+				conn_impl->state = CONN_STATE_FINISHED;
+				continue;
+			}
+		}
+	}
+#else
 	for (nfds_t i = 1; i < pfds->size; ++i) {
 		struct pollfd *pfd = pfds->pfds + i;
 		if (pfd->fd == INVALID_SOCKET)
@@ -263,10 +366,6 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 			int left = 1000; // limit for fairness between sockets
 			while (left-- &&
 			       (ret = conn_poll_recv(conn_impl->sock, buffer, BUFFER_SIZE, &src)) > 0) {
-#if USE_XDP
-				update_src_addr(registry->juice_xsk, conn_impl->sock, &src);
-#endif
-
 				if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
 					JLOG_WARN("Agent receive failed");
 					conn_impl->state = CONN_STATE_FINISHED;
@@ -296,6 +395,7 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 			}
 		}
 	}
+#endif
 	mutex_unlock(&registry->mutex);
 	return 0;
 }
