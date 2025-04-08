@@ -161,7 +161,6 @@ int receive_xsk_packets(xsk_socket_info_t *juice_xsk) {
 	unsigned int idx = 0;
 	int sum = xsk_ring_cons__peek(&juice_xsk->rx, 64, &idx); // 這次收到的封包數量
 	if (!sum) return 0;
-	JLOG_INFO("PurpleRed: Received %d packets", sum);
 
 	// INFO: 從 rx[idx] 開始取 descriptor (desc)，再從 umem_area 取封包內容，重複 sum 次
 	for (int i = 0; i < sum; i++) {
@@ -199,53 +198,53 @@ int receive_xsk_packets(xsk_socket_info_t *juice_xsk) {
 
 
 // INFO: receive_xsk_packets() 每收到一個封包，就會呼叫此函式一次，用來拆解 L2~L4 層
-void packet_handler(xsk_socket_info_t *juice_xsk, void *packet, int packet_len) {
-	wss_value_t value;
-	memset(&value, 0, sizeof(value));
-	// 以下跟 XDP 程式邏輯幾乎一樣
-	struct ethhdr *eth = packet;
+void packet_handler(xsk_socket_info_t *juice_xsk, void *raw_pkt, int raw_pkt_len) {
+	pipe_recv_t pkt;
+	memset(&pkt, 0, sizeof(pkt));
+
+	struct ethhdr *eth = raw_pkt;
 	uint16_t eth_proto = ntohs(eth->h_proto);
 	struct udphdr *udph;
+	char ip_str[INET6_ADDRSTRLEN];
 	if (eth_proto == ETH_P_IP) {
 		struct iphdr *ip4h = (void *)(eth + 1);
 		udph = (void *)((__u8 *)ip4h + (ip4h->ihl * 4));
-		value.ip_version = 4;
-		value.src_ipv4 = ip4h->saddr;
+		struct sockaddr_in *addr4 = (struct sockaddr_in *)&(pkt.src.addr);
+		addr4->sin_family = AF_INET;
+		addr4->sin_addr.s_addr = ip4h->saddr;  // network byte order
+		addr4->sin_port = udph->source;        // network byte order
+		pkt.src.len = sizeof(struct sockaddr_in);
 	} else if (eth_proto == ETH_P_IPV6) {
 		struct ipv6hdr *ip6h = (void *)(eth + 1);
 		udph = (void *)(ip6h + 1);
-		value.ip_version = 6;
-		memcpy(&(value.src_ipv6), &(ip6h->saddr), 16);
-	}
-	value.src_port = ntohs(udph->source);  // src port
-	uint16_t dest_port = ntohs(udph->dest); // dest port
-	// end
-
-	// INFO: 判斷是否要更新 wss_map[dest]（包含 src IP & port）
-	wss_value_t old_value;
-	bpf_map_lookup_elem(juice_xsk->wss_map_fd, &dest_port, &old_value);
-	value.socket_fd = old_value.socket_fd; // 從 old_value 取出 socket fd
-	if (old_value.ip_version == 0) {
-		bpf_map_update_elem(juice_xsk->wss_map_fd, &dest_port, &value, BPF_ANY);  // 寫入 value，覆寫 old_value
+		struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&(pkt.src.addr);
+		addr6->sin6_family = AF_INET6;
+		memcpy(addr6->sin6_addr.s6_addr, &(ip6h->saddr), 16);  // network byte order
+		addr6->sin6_port = udph->source;                       // network byte order
+		pkt.src.len = sizeof(struct sockaddr_in6);
 	}
 
-	// INFO: 自己傳給自己（笨方法）
-	struct sockaddr_storage addr;
-	socklen_t addrlen;
-	getsockname(value.socket_fd, (struct sockaddr *)&addr, &addrlen); // 查詢 sock 綁定的位址，並寫入 addr
-	sendto(value.socket_fd, (void *)(udph + 1), packet + packet_len - (void *)(udph + 1), 0,
-	       (struct sockaddr *)&addr, addrlen);
+	pkt.payload = (void *)(udph + 1);
+	pkt.payload_len = raw_pkt + raw_pkt_len - pkt.payload;  // 去掉 L2~L4 header 的長度
+
+	// INFO: 根據 wss_map[dest_port] 找到對應的 pipe 並傳送 pkt
+	uint16_t dest_port = ntohs(udph->dest); // host byte order
+	wss_value_t value;
+	memset(&value, 0, sizeof(value));
+	bpf_map_lookup_elem(juice_xsk->wss_map_fd, &dest_port, &value);
+	write(value.pipe_out_fd, &pkt, sizeof(pkt));
 }
 
-// INFO: 寫入新的 port 和 socket fd 至 wss_map（不含 src IP & port）
-int add_port_to_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk) {
+// INFO: 寫入 socket fd 和 pipe_out fd 至 wss_map[port]（不含 src IP & port）
+int create_wss_map_member(socket_t sock, int pipe_out, xsk_socket_info_t *juice_xsk) {
 	uint16_t port = udp_get_port(sock);
 	wss_value_t value;
 	memset(&value, 0, sizeof(value));
 	value.socket_fd = sock;
+	value.pipe_out_fd = pipe_out;
 	if (bpf_map_update_elem(juice_xsk->wss_map_fd, &port, &value, BPF_ANY) == 0) {
-		JLOG_INFO("PurpleRed: XDP will redirect all packets sent to port %hu to socket (fd = %d)",
-		          port, sock);
+		JLOG_INFO("PurpleRed: XDP will redirect all packets sent to port %hu to pipe (fd = %d)",
+		          port, pipe_out);
 		return 0;
 	}
 
@@ -262,7 +261,7 @@ void remove_from_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk) {
 		JLOG_INFO("PurpleRed: Removed port %hu from wss_map", port);
 	}
 
-	JLOG_WARN("PurpleRed: Failed to remove port %hu from WSS_map", port);
+	JLOG_WARN("PurpleRed: Failed to remove port %hu from wss_map", port);
 }
 
 void update_src_addr(xsk_socket_info_t *juice_xsk, socket_t sock, addr_record_t *src) {

@@ -24,8 +24,10 @@ typedef struct xsk_socket_info {
 	int cnt;  // test
 } xsk_socket_info_t;
 
+// INFO: 必須與 XDP 程式的 wss_value 資料結構保持一致
 typedef struct wss_value {
 	__u32 socket_fd;
+	__u32 pipe_out_fd;
 	__u8 ip_version;
 	union {
 		__u32 src_ipv4;
@@ -34,13 +36,19 @@ typedef struct wss_value {
 	__u32 src_port;
 } wss_value_t;
 
+typedef struct pipe_recv {
+	addr_record_t src;
+	void *payload;
+	int payload_len;
+} pipe_recv_t;
+
 int initialize_xsk(xsk_socket_info_t **juice_xsk);
 void prime_fill_ring(struct xsk_ring_prod *fill);
 int receive_xsk_packets(xsk_socket_info_t *juice_xsk);
 void packet_handler(xsk_socket_info_t *juice_xsk, void *packet, int packet_len);
-int add_port_to_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk);
+int create_wss_map_member(socket_t sock, int pipe_out, xsk_socket_info_t *juice_xsk);
 void remove_from_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk);
-void update_src_addr(xsk_socket_info_t *juice_xsk, socket_t sock, addr_record_t *src);
+// void update_src_addr(xsk_socket_info_t *juice_xsk, socket_t sock, addr_record_t *src);
 void free_xsk_resources(xsk_socket_info_t *juice_xsk, int option);
 
 #endif

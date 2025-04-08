@@ -12,12 +12,13 @@
 #include "socket.h"
 #include "thread.h"
 #include "udp.h"
-#if USE_XDP
-#include "xsk.h"
-#endif
 
 #include <assert.h>
 #include <string.h>
+
+#if USE_XDP
+#include "xsk.h"
+#endif
 
 #define BUFFER_SIZE 4096
 
@@ -40,6 +41,10 @@ typedef struct conn_impl {
 	mutex_t send_mutex;
 	int send_ds;
 	timestamp_t next_timestamp;
+#if USE_XDP
+	int pipe_out;
+	int pipe_in;
+#endif
 } conn_impl_t;
 
 typedef struct pfds_record {
@@ -49,7 +54,11 @@ typedef struct pfds_record {
 
 int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_t *next_timestamp);
 int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds);
+#if USE_XDP
+int conn_poll_recv(int pipe_in_fd, char *buffer, addr_record_t *src);
+#else
 int conn_poll_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src);
+#endif
 int conn_poll_run(conn_registry_t *registry);
 
 static thread_return_t THREAD_CALL conn_thread_entry(void *arg) {
@@ -80,7 +89,7 @@ int conn_poll_registry_init(conn_registry_t *registry, udp_socket_config_t *conf
 #else
 	int pipefds[2];
 	if (pipe(pipefds)) {
-		JLOG_FATAL("Pipe creation failed");
+		JLOG_FATAL("Interrupt Pipe creation failed");
 		free(registry_impl);
 		return -1;
 	}
@@ -134,7 +143,6 @@ void conn_poll_registry_cleanup(conn_registry_t *registry) {
 }
 
 int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_t *next_timestamp) {
-	JLOG_WARN("PurpleRed: conn_poll_prepare()");
 	timestamp_t now = current_timestamp();
 	*next_timestamp = now + 60000;
 
@@ -173,7 +181,7 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 		struct pollfd *pfd = pfds->pfds + i;
 		juice_agent_t *agent = registry->agents[i - 2];
 		if (!agent) {
-			pfd->fd = INVALID_SOCKET;
+			pfd->fd = -1;  // invalid pipe
 			pfd->events = 0;
 			continue;
 		}
@@ -181,7 +189,7 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 		conn_impl_t *conn_impl = agent->conn_impl;
 		if (!conn_impl ||
 		    (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY)) {
-			pfd->fd = INVALID_SOCKET;
+			pfd->fd = -1;  // invalid pipe
 			pfd->events = 0;
 			continue;
 		}
@@ -192,7 +200,7 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 		if (*next_timestamp > conn_impl->next_timestamp)
 			*next_timestamp = conn_impl->next_timestamp;
 
-		pfd->fd = conn_impl->sock;
+		pfd->fd = conn_impl->pipe_in;
 		pfd->events = POLLIN;
 	}
 #else
@@ -233,8 +241,35 @@ error:
 	return -1;
 }
 
+#if USE_XDP
+int conn_poll_recv(int pipe_in_fd, char *buffer, addr_record_t *src) {
+	JLOG_VERBOSE("Receiving datagram");
+	pipe_recv_t pkt;
+	int ret;
+	while (true) {
+		if ((ret = read(pipe_in_fd, &pkt, sizeof(pipe_recv_t))) == sizeof(pipe_recv_t) &&
+		    pkt.payload_len == 0)
+			continue; // Empty datagram, ignore
+		else break;
+    }
+
+	if (ret < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			JLOG_VERBOSE("No more datagrams to receive");
+			return 0;
+		}
+		JLOG_ERROR("PurpleRed: failed to read pipe_in, errno=%d", errno);
+		return -1;
+	}
+	
+	memcpy(buffer, pkt.payload, pkt.payload_len);
+	memcpy(src, &(pkt.src), sizeof(addr_record_t));
+	addr_unmap_inet6_v4mapped((struct sockaddr *)&src->addr, &src->len);
+
+	return pkt.payload_len; // len > 0
+}
+#else
 int conn_poll_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
-	JLOG_WARN("PurpleRed: conn_poll_recv()");
 	JLOG_VERBOSE("Receiving datagram");
 	int len;
 	while ((len = udp_recvfrom(sock, buffer, size, src)) == 0) {
@@ -253,9 +288,9 @@ int conn_poll_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src)
 	addr_unmap_inet6_v4mapped((struct sockaddr *)&src->addr, &src->len);
 	return len; // len > 0
 }
+#endif
 
 int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
-	JLOG_WARN("PurpleRed: conn_poll_process()");
 	struct pollfd *interrupt_pfd = pfds->pfds;
 	if (interrupt_pfd->revents & POLLIN) {
 #ifdef _WIN32
@@ -276,13 +311,12 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 #if USE_XDP
 	struct pollfd *xsk_pfd = pfds->pfds + 1;
 	if (xsk_pfd->revents & POLLIN) {
-		JLOG_WARN("PurpleRed: juice_xsk POLLIN");
 		receive_xsk_packets(registry->juice_xsk);
 	}
 
 	for (nfds_t i = 2; i < pfds->size; ++i) {
 		struct pollfd *pfd = pfds->pfds + i;
-		if (pfd->fd == INVALID_SOCKET)
+		if (pfd->fd == -1)  // invalid pipe
 			continue;
 
 		juice_agent_t *agent = registry->agents[i - 2];
@@ -290,11 +324,11 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 			continue;
 
 		conn_impl_t *conn_impl = agent->conn_impl;
-		if (!conn_impl || conn_impl->sock != pfd->fd || conn_impl->state != CONN_STATE_READY)
+		if (!conn_impl || conn_impl->pipe_in != pfd->fd || conn_impl->state != CONN_STATE_READY)
 			continue;
 
 		if (pfd->revents & POLLNVAL || pfd->revents & POLLERR) {
-			JLOG_WARN("Error when polling socket");
+			JLOG_WARN("PurpleRed: Error when polling pipe");
 			agent_conn_fail(agent);
 			conn_impl->state = CONN_STATE_FINISHED;
 			continue;
@@ -304,17 +338,17 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 			char buffer[BUFFER_SIZE];
 			addr_record_t src;
 			int ret = 0;
-			int left = 1000; // limit for fairness between sockets
+			int left = 1000; // limit for fairness between pipes
 			while (left-- &&
-			       (ret = conn_poll_recv(conn_impl->sock, buffer, BUFFER_SIZE, &src)) > 0) {
-				update_src_addr(registry->juice_xsk, conn_impl->sock, &src);
-				
+			       (ret = conn_poll_recv(conn_impl->pipe_in, buffer, &src)) > 0) {
 				if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
 					JLOG_WARN("Agent receive failed");
 					conn_impl->state = CONN_STATE_FINISHED;
 					break;
 				}
 			}
+			// TODO: free umem frame
+
 			if (conn_impl->state == CONN_STATE_FINISHED)
 			continue;
 			
@@ -401,7 +435,6 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 }
 
 int conn_poll_run(conn_registry_t *registry) {
-	JLOG_WARN("PurpleRed: conn_poll_run()");
 	pfds_record_t pfds;
 	pfds.pfds = NULL;
 	pfds.size = 0;
@@ -439,7 +472,6 @@ int conn_poll_run(conn_registry_t *registry) {
 }
 
 int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_config_t *config) {
-	JLOG_WARN("PurpleRed: conn_poll_init()");
 	conn_impl_t *conn_impl = calloc(1, sizeof(conn_impl_t));
 	if (!conn_impl) {
 		JLOG_FATAL("Memory allocation failed for connection impl");
@@ -454,7 +486,19 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 	}
 
 #if USE_XDP
-	if (add_port_to_wss_map(conn_impl->sock, registry->juice_xsk)) {
+	int pipefds[2];
+	if (pipe(pipefds)) {
+		JLOG_FATAL("PurpleRed: Pipe creation failed");
+		free(conn_impl);
+		return -1;
+	}
+
+	fcntl(pipefds[0], F_SETFL, O_NONBLOCK);
+	fcntl(pipefds[1], F_SETFL, O_NONBLOCK);
+	conn_impl->pipe_in = pipefds[0];
+	conn_impl->pipe_out = pipefds[1];
+
+	if (create_wss_map_member(conn_impl->sock, conn_impl->pipe_out, registry->juice_xsk)) {
 		free(conn_impl);
 		return -1;
 	}
@@ -468,7 +512,6 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 }
 
 void conn_poll_cleanup(juice_agent_t *agent) {
-	JLOG_WARN("PurpleRed: conn_poll_cleanup()");
 	conn_impl_t *conn_impl = agent->conn_impl;
 
 	conn_poll_interrupt(agent);
@@ -483,21 +526,18 @@ void conn_poll_cleanup(juice_agent_t *agent) {
 }
 
 void conn_poll_lock(juice_agent_t *agent) {
-	JLOG_WARN("PurpleRed: conn_poll_lock()");
 	conn_impl_t *conn_impl = agent->conn_impl;
 	conn_registry_t *registry = conn_impl->registry;
 	mutex_lock(&registry->mutex);
 }
 
 void conn_poll_unlock(juice_agent_t *agent) {
-	JLOG_WARN("PurpleRed: conn_poll_unlock()");
 	conn_impl_t *conn_impl = agent->conn_impl;
 	conn_registry_t *registry = conn_impl->registry;
 	mutex_unlock(&registry->mutex);
 }
 
 int conn_poll_interrupt(juice_agent_t *agent) {
-	JLOG_WARN("PurpleRed: conn_poll_interrupt()");
 	conn_impl_t *conn_impl = agent->conn_impl;
 	conn_registry_t *registry = conn_impl->registry;
 	registry_impl_t *registry_impl = registry->impl;
@@ -527,7 +567,6 @@ int conn_poll_interrupt(juice_agent_t *agent) {
 
 int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
                    int ds) {
-	JLOG_WARN("PurpleRed: conn_poll_send()");
 	conn_impl_t *conn_impl = agent->conn_impl;
 
 	mutex_lock(&conn_impl->send_mutex);
@@ -558,7 +597,6 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 }
 
 int conn_poll_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size) {
-	JLOG_WARN("PurpleRed: conn_poll_addrs()");
 	conn_impl_t *conn_impl = agent->conn_impl;
 
 	return udp_get_addrs(conn_impl->sock, records, size);

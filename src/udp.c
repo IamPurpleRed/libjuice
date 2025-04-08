@@ -17,10 +17,6 @@
 #include <string.h>
 #include <time.h>
 
-#if USE_XDP
-#include "xsk.h"
-#endif
-
 static struct addrinfo *find_family(struct addrinfo *ai_list, int family) {
 	struct addrinfo *ai = ai_list;
 	while (ai && ai->ai_family != family)
@@ -181,7 +177,6 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 }
 
 int udp_recvfrom(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
-	JLOG_WARN("PurpleRed: udp_recvfrom()");
 	while (true) {
 		src->len = sizeof(src->addr);
 		int len =
