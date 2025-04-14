@@ -202,40 +202,32 @@ void packet_handler(xsk_socket_info_t *juice_xsk, void *raw_pkt, int raw_pkt_len
 	pipe_recv_t pkt;
 	memset(&pkt, 0, sizeof(pkt));
 
-	struct ethhdr *eth = raw_pkt;
-	uint16_t eth_proto = ntohs(eth->h_proto);
-	struct udphdr *udph;
-	char ip_str[INET6_ADDRSTRLEN];
-	if (eth_proto == ETH_P_IP) {
-		struct iphdr *ip4h = (void *)(eth + 1);
-		udph = (void *)((__u8 *)ip4h + (ip4h->ihl * 4));
+	wss_metadata_t *metadata = (wss_metadata_t *)raw_pkt;
+	pkt.payload = (void *)(metadata + 1);
+	pkt.payload_len = raw_pkt_len - sizeof(wss_metadata_t);
+	if (metadata->src_ip_version == 4) {
 		struct sockaddr_in *addr4 = (struct sockaddr_in *)&(pkt.src.addr);
 		addr4->sin_family = AF_INET;
-		addr4->sin_addr.s_addr = ip4h->saddr;  // network byte order
-		addr4->sin_port = udph->source;        // network byte order
+		addr4->sin_addr.s_addr = metadata->src_ipv4;  // network byte order
+		addr4->sin_port = metadata->src_port;         // network byte order
 		pkt.src.len = sizeof(struct sockaddr_in);
-	} else if (eth_proto == ETH_P_IPV6) {
-		struct ipv6hdr *ip6h = (void *)(eth + 1);
-		udph = (void *)(ip6h + 1);
+
+		char ip_str[INET_ADDRSTRLEN];
+		inet_ntop(AF_INET, &(metadata->src_ipv4), ip_str, sizeof(ip_str));
+		uint16_t port = ntohs(metadata->src_port);
+	} else {
 		struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&(pkt.src.addr);
 		addr6->sin6_family = AF_INET6;
-		memcpy(addr6->sin6_addr.s6_addr, &(ip6h->saddr), 16);  // network byte order
-		addr6->sin6_port = udph->source;                       // network byte order
+		memcpy(addr6->sin6_addr.s6_addr, &(metadata->src_ipv6), 16);  // network byte order
+		addr6->sin6_port = metadata->src_port;                        // network byte order
 		pkt.src.len = sizeof(struct sockaddr_in6);
 	}
 
-	pkt.payload = (void *)(udph + 1);
-	pkt.payload_len = raw_pkt + raw_pkt_len - pkt.payload;  // 去掉 L2~L4 header 的長度
-
-	// INFO: 根據 wss_map[dest_port] 找到對應的 pipe 並傳送 pkt
-	uint16_t dest_port = ntohs(udph->dest); // host byte order
-	wss_value_t value;
-	memset(&value, 0, sizeof(value));
-	bpf_map_lookup_elem(juice_xsk->wss_map_fd, &dest_port, &value);
-	write(value.pipe_out_fd, &pkt, sizeof(pkt));
+	// INFO: 將 pkt 寫入 pipe
+	write(metadata->pipe_out_fd, &pkt, sizeof(pkt));
 }
 
-// INFO: 寫入 socket fd 和 pipe_out fd 至 wss_map[port]（不含 src IP & port）
+// INFO: 寫入 socket fd 和 pipe_out fd 至 wss_map[port]
 int create_wss_map_member(socket_t sock, int pipe_out, xsk_socket_info_t *juice_xsk) {
 	uint16_t port = udp_get_port(sock);
 	wss_value_t value;
@@ -264,23 +256,6 @@ void remove_from_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk) {
 	JLOG_WARN("PurpleRed: Failed to remove port %hu from wss_map", port);
 }
 
-void update_src_addr(xsk_socket_info_t *juice_xsk, socket_t sock, addr_record_t *src) {
-	uint16_t port = udp_get_port(sock);
-	wss_value_t value;
-	bpf_map_lookup_elem(juice_xsk->wss_map_fd, &port, &value);
-	if (value.ip_version == 4) {
-		struct sockaddr_in *addr4 = (struct sockaddr_in *)&(src->addr);
-		addr4->sin_family = AF_INET;
-		addr4->sin_port = htons(value.src_port); // 必須轉為 network byte order
-		addr4->sin_addr.s_addr = value.src_ipv4; // ipv4 已是 network byte order
-	} else if (value.ip_version == 6) {
-		struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&(src->addr);
-		addr6->sin6_family = AF_INET6;
-		addr6->sin6_port = htons(value.src_port);             // 必須轉為 network byte order
-		memcpy(addr6->sin6_addr.s6_addr, value.src_ipv6, 16); // ipv6 已是 network byte order
-	}
-	src->len = sizeof(src->addr);
-}
 
 void free_xsk_resources(xsk_socket_info_t *juice_xsk, int option) {
 	switch (option) {
