@@ -18,7 +18,12 @@
 
 #if USE_XDP
 #include "xsk.h"
+#else
+#include <bpf/bpf.h>  // EXPERIMENT
 #endif
+
+#include <stdio.h>    // EXPERIMENT
+#include <time.h>     // EXPERIMENT
 
 #define BUFFER_SIZE 4096
 
@@ -59,6 +64,8 @@ int conn_poll_recv(xdp_agent_rb_t *rb, char *buffer, addr_record_t *src);
 int conn_poll_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src);
 #endif
 int conn_poll_run(conn_registry_t *registry);
+
+void experiment(conn_registry_t *registry);  // EXPERIMENT
 
 static thread_return_t THREAD_CALL conn_thread_entry(void *arg) {
 	thread_set_name_self("juice poll");
@@ -333,6 +340,12 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 			int ret = 0;
 			int left = 1000; // limit for fairness between pipes
 			while (left-- && (ret = conn_poll_recv(conn_impl->recv_rb, buffer, &src)) > 0) {
+				// EXPERIMENT
+				if (registry->packet_count < PKT_COUNT) {
+					experiment(registry);
+				}
+				// EXPERIMENT END
+
 				if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
 					JLOG_WARN("Agent receive failed");
 					conn_impl->state = CONN_STATE_FINISHED;
@@ -391,6 +404,12 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 			int left = 1000; // limit for fairness between sockets
 			while (left-- &&
 			       (ret = conn_poll_recv(conn_impl->sock, buffer, BUFFER_SIZE, &src)) > 0) {
+				// EXPERIMENT
+				if (registry->packet_count < PKT_COUNT) {
+					experiment(registry);
+				}
+				// EXPERIMENT END
+
 				if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
 					JLOG_WARN("Agent receive failed");
 					conn_impl->state = CONN_STATE_FINISHED;
@@ -487,6 +506,17 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 		free(conn_impl);
 		return -1;
 	}
+#else
+	// EXPERIMENT: 寫入 port 至 wss_map，value 固定為 0 (無意義)
+	uint16_t port = udp_get_port(conn_impl->sock);
+	int value = 0;
+	if (bpf_map_update_elem(registry->wss_map_fd, &port, &value, BPF_ANY) != 0) {
+		JLOG_ERROR("PurpleRed: Failed to update eBPF map with port %hu", port);
+		free(conn_impl);
+		return -1;
+	}
+	JLOG_INFO("PurpleRed: Recorded port %hu to wss_map", port);
+	// EXPERIMENT END
 #endif
 
 	mutex_init(&conn_impl->send_mutex, 0);
@@ -504,6 +534,16 @@ void conn_poll_cleanup(juice_agent_t *agent) {
 	mutex_destroy(&conn_impl->send_mutex);
 #if USE_XDP
 	remove_port_from_wss_map(conn_impl->sock, agent->registry->juice_xdp);
+#else
+	// EXPERIMENT: 等同於 remove_from_wss_map()
+	uint16_t port = udp_get_port(conn_impl->sock);
+	int wss_map_fd = agent->registry->wss_map_fd;
+	if (bpf_map_delete_elem(wss_map_fd, &port) == 0) {
+		JLOG_INFO("PurpleRed: Removed port %hu from wss_map", port);
+	}
+
+	JLOG_WARN("PurpleRed: Failed to remove port %hu from wss_map", port);
+	// EXPERIMENT END
 #endif
 	closesocket(conn_impl->sock);
 	free(agent->conn_impl);
@@ -586,3 +626,22 @@ int conn_poll_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t siz
 
 	return udp_get_addrs(conn_impl->sock, records, size);
 }
+
+// EXPERIMENT
+// INFO: 紀錄第二個時間點，如果已經接收 PKT_COUNT 個封包，呼叫 calc_result()
+void experiment(conn_registry_t *registry) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	uint64_t time1, time2 = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+	registry->packet_count++;
+	if (bpf_map_lookup_elem(registry->experiment_map_fd, &(registry->packet_count), &time1) != 0) {
+		JLOG_WARN("PurpleRed: Read experiment_map[%d] failed", registry->packet_count);
+		return;
+	}
+
+	fprintf(registry->fp, "%llu,%llu,%llu\n", time1, time2, time2 - time1);
+	if (registry->packet_count == PKT_COUNT) {
+		fclose(registry->fp);
+	}
+}
+// EXPERIMENT END

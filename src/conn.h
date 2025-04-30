@@ -22,6 +22,8 @@
 #include "xsk.h"
 #endif
 
+#include <stdio.h> // EXPERIMENT
+
 typedef struct juice_agent juice_agent_t;
 
 // Generic connection interface for agents
@@ -36,7 +38,12 @@ typedef struct conn_registry {
 	int agents_count;
 #if USE_XDP
 	xdp_info_t *juice_xdp;
+#else
+	int wss_map_fd;             // EXPERIMENT
 #endif
+	FILE *fp;                   // EXPERIMENT
+	int experiment_map_fd;      // EXPERIMENT
+	int packet_count;           // EXPERIMENT
 } conn_registry_t;
 
 typedef struct conn_mode_entry {

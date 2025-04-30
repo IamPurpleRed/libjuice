@@ -18,6 +18,8 @@
 
 #if USE_XDP
 #include "xsk.h"
+#else
+#include <bpf/bpf.h>  // EXPERIMENT
 #endif
 
 #define INITIAL_REGISTRY_SIZE 16
@@ -104,7 +106,61 @@ static int acquire_registry(conn_mode_entry_t *entry, udp_socket_config_t *confi
 			free(registry);
 			return -1;
 		}
+#else
+		// EXPERIMENT: 尋找 wss_map 的 file descriptor
+		registry->wss_map_fd = bpf_obj_get("/sys/fs/bpf/wss_map");
+		if (registry->wss_map_fd < 0) {
+			JLOG_FATAL("PurpleRed: Failed to get wss_map");
+			mutex_unlock(&registry->mutex);
+			entry->registry_cleanup_func(registry);
+			free(registry->agents);
+			free(registry);
+			return -1;
+		}
+		// EXPERIMENT END
 #endif
+
+		// EXPERIMENT: 建立輸出檔案
+		registry->fp = fopen("result.csv", "w");
+		if (registry->fp == NULL) {
+			JLOG_FATAL("PurpleRed: Create result.csv failed");
+			mutex_unlock(&registry->mutex);
+			entry->registry_cleanup_func(registry);
+			free(registry->agents);
+			free(registry);
+			return -1;
+		}
+		fprintf(registry->fp, "time1,time2,delta\n");  // 寫入標題列
+		// EXPERIMENT END
+
+		// EXPERIMENT: 尋找 experiment_map 的 file descriptor
+		int experiment_map_fd = bpf_obj_get("/sys/fs/bpf/experiment_map");
+		if (experiment_map_fd < 0) {
+			JLOG_FATAL("PurpleRed: Failed to get experiment_map");
+			mutex_unlock(&registry->mutex);
+			entry->registry_cleanup_func(registry);
+			free(registry->agents);
+			free(registry);
+			return -1;
+		}
+		// EXPERIMENT END
+
+		// EXPERIMENT: 初始化 experiment_map (全部歸零)
+		registry->experiment_map_fd = experiment_map_fd;
+		registry->packet_count = 0;
+		const long long int zero = 0;
+		for (int i = 0; i <= PKT_COUNT; i++) {
+			if (bpf_map_update_elem(experiment_map_fd, &i, &zero, BPF_ANY) != 0) {
+				JLOG_FATAL("PurpleRed: Failed to write 0 to experiment_map[%d]", i);
+				mutex_unlock(&registry->mutex);
+				entry->registry_cleanup_func(registry);
+				free(registry->agents);
+				free(registry);
+				return -1;
+			}
+		}
+		JLOG_WARN("PurpleRed: Reset experiment_map to 0");
+		// EXPERIMENT END
 
 		entry->registry = registry;
 	} else {
