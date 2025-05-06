@@ -99,7 +99,7 @@ static int acquire_registry(conn_mode_entry_t *entry, udp_socket_config_t *confi
 #if USE_XDP
 		if (initialize_xsk(&(registry->juice_xsk))) {
 			mutex_unlock(&registry->mutex);
-			free(registry->impl);
+			entry->registry_cleanup_func(registry);
 			free(registry->agents);
 			free(registry);
 			return -1;

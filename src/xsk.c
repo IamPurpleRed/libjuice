@@ -37,7 +37,7 @@ int initialize_xsk(xsk_socket_info_t **juice_xsk_ptr) {
 		free_xsk_resources(juice_xsk, 0);
 		return -1;
 	}
-	(juice_xsk)->wss_map_fd = wss_map_fd;
+	juice_xsk->wss_map_fd = wss_map_fd;
 
 	// INFO: 尋找 xsk_map 的 file descriptor
 	int xsk_map_fd = bpf_obj_get("/sys/fs/bpf/xsk_map");

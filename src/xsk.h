@@ -20,8 +20,6 @@ typedef struct xsk_socket_info {
 	struct xsk_ring_cons rx; // 讀取 frame descriptor 以獲得封包 -> consumer
 	struct xsk_ring_prod tx;
 	int xsk_fd;
-
-	int cnt;  // test
 } xsk_socket_info_t;
 
 // INFO: 必須與 XDP 程式的 wss_metadata 資料結構保持一致
