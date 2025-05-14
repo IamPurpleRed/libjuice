@@ -19,44 +19,44 @@
 #define FILL_RING_SIZE 4096
 
 
-int initialize_xsk(xsk_socket_info_t **juice_xsk_ptr) {
-	if (*juice_xsk_ptr)
+int initialize_juice_xdp(xdp_info_t **juice_xdp_ptr) {
+	if (*juice_xdp_ptr)
 		return 0; // 已初始化
 
-	*juice_xsk_ptr = calloc(1, sizeof(xsk_socket_info_t));
-	if (!juice_xsk_ptr) {
-		JLOG_FATAL("PurpleRed: Memory allocation for juice_xsk failed");
+	*juice_xdp_ptr = calloc(1, sizeof(xdp_info_t));
+	if (!juice_xdp_ptr) {
+		JLOG_FATAL("PurpleRed: Memory allocation for juice_xdp failed");
 		return -1;
 	}
-	xsk_socket_info_t *juice_xsk = *juice_xsk_ptr;
+	xdp_info_t *juice_xdp = *juice_xdp_ptr;
 
 	// INFO: 尋找 wss_map 的 file descriptor
 	int wss_map_fd = bpf_obj_get("/sys/fs/bpf/wss_map");
 	if (wss_map_fd < 0) {
 		JLOG_FATAL("PurpleRed: Failed to get wss_map");
-		free_xsk_resources(juice_xsk, 0);
+		juice_xdp_cleanup(juice_xdp, 0);
 		return -1;
 	}
-	juice_xsk->wss_map_fd = wss_map_fd;
+	juice_xdp->wss_map_fd = wss_map_fd;
 
 	// INFO: 尋找 xsk_map 的 file descriptor
 	int xsk_map_fd = bpf_obj_get("/sys/fs/bpf/xsk_map");
 	if (xsk_map_fd < 0) {
 		JLOG_FATAL("PurpleRed: Failed to get xsk_map");
-		free_xsk_resources(juice_xsk, 0);
+		juice_xdp_cleanup(juice_xdp, 0);
 		return -1;
 	}
-	juice_xsk->xsk_map_fd = xsk_map_fd;
+	juice_xdp->xsk_map_fd = xsk_map_fd;
 
 	// INFO: 在 user space 分配 4096 * 4096 Byte 的空間
 	void *umem_area = mmap(NULL, 4096 * 4096, PROT_READ | PROT_WRITE,
 	                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
 	if (umem_area == MAP_FAILED) {
 		JLOG_FATAL("PurpleRed: Memory allocation for umem_area failed");
-		free_xsk_resources(juice_xsk, 0);
+		juice_xdp_cleanup(juice_xdp, 0);
 		return -1;
 	}
-	juice_xsk->umem_area = umem_area;
+	juice_xdp->umem_area = umem_area;
 
 	// INFO: 建立 fill ring & completion ring
 	struct xsk_umem_config xsk_umem_cfg;
@@ -70,12 +70,12 @@ int initialize_xsk(xsk_socket_info_t **juice_xsk_ptr) {
 	struct xsk_ring_cons comp;
 	if (xsk_umem__create(&umem, umem_area, 4096 * 4096, &fill, &comp, &xsk_umem_cfg)) {
 		JLOG_FATAL("PurpleRed: XSK access umem_area failed");
-		free_xsk_resources(juice_xsk, 1);
+		juice_xdp_cleanup(juice_xdp, 1);
 		return -1;
 	}
-	juice_xsk->umem = umem;
-	juice_xsk->fill = fill;
-	juice_xsk->comp = comp;
+	juice_xdp->umem = umem;
+	juice_xdp->fill = fill;
+	juice_xdp->comp = comp;
 
 	// INFO: 建立 AF_XDP socket
 	// FUTURE: 支援多個 queue 的網卡
@@ -90,25 +90,25 @@ int initialize_xsk(xsk_socket_info_t **juice_xsk_ptr) {
 	struct xsk_ring_prod tx;
 	if (xsk_socket__create(&xsk, XDP_IFNAME, 0, umem, &rx, &tx, &xsk_cfg)) {
 		JLOG_FATAL("PurpleRed: XSK creation failed");
-		free_xsk_resources(juice_xsk, 2);
+		juice_xdp_cleanup(juice_xdp, 2);
 		return -1;
 	}
-	juice_xsk->xsk = xsk;
-	juice_xsk->rx = rx;
-	juice_xsk->tx = tx;
-	juice_xsk->xsk_fd = xsk_socket__fd(xsk);
+	juice_xdp->xsk = xsk;
+	juice_xdp->rx = rx;
+	juice_xdp->tx = tx;
+	juice_xdp->xsk_fd = xsk_socket__fd(xsk);
 
 	// INFO: 將 queue_id 和 xsk 寫入 xsk_map -> 綁定
 	// FUTURE: 支援多個 queue 的網卡
 	int queue_id = 0;
-	if (bpf_map_update_elem(xsk_map_fd, &queue_id, &(juice_xsk->xsk_fd), BPF_ANY) != 0) {
+	if (bpf_map_update_elem(xsk_map_fd, &queue_id, &(juice_xdp->xsk_fd), BPF_ANY) != 0) {
 		JLOG_FATAL("PurpleRed: Failed to bind XSK fd to xsk_map");
-		free_xsk_resources(juice_xsk, 3);
+		juice_xdp_cleanup(juice_xdp, 3);
 		return -1;
 	}
 
 	// INFO: 將可用的 UMEM frame index 放入 fill queue，讓 kernel 知道哪些 index 可以放置從 XSK 來的封包
-	prime_fill_ring(&(juice_xsk->fill));
+	prime_fill_ring(&(juice_xdp->fill));
 
 	return 0;
 }
@@ -151,55 +151,55 @@ void prime_fill_ring(struct xsk_ring_prod *fill) {
 }
 
 
-int receive_xsk_packets(xsk_socket_info_t *juice_xsk) {
-	if (!juice_xsk) {
-		JLOG_FATAL("PurpleRed: juice_xsk is not exist");
+int receive_xsk_packets(xdp_info_t *juice_xdp) {
+	if (!juice_xdp) {
+		JLOG_FATAL("PurpleRed: juice_xdp is not exist");
 		return -1;
 	}
 
 	// INFO: 首先查看 RX ring (rx) 目前有幾個 UMEM frame descriptor 可接收，從哪裡開始接收
 	unsigned int idx = 0;
-	int sum = xsk_ring_cons__peek(&juice_xsk->rx, 64, &idx); // 這次收到的封包數量
+	int sum = xsk_ring_cons__peek(&juice_xdp->rx, 64, &idx); // 這次收到的封包數量
 	if (!sum) return 0;
 
 	// INFO: 從 rx[idx] 開始取 descriptor (desc)，再從 umem_area 取封包內容，重複 sum 次
 	for (int i = 0; i < sum; i++) {
-		const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&juice_xsk->rx, idx++);
-		void *packet = xsk_umem__get_data(juice_xsk->umem_area, desc->addr);
-		packet_handler(juice_xsk, packet, desc->len);
+		const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&juice_xdp->rx, idx++);
+		void *packet = xsk_umem__get_data(juice_xdp->umem_area, desc->addr);
+		packet_handler(juice_xdp, packet, desc->len);
 	}
 
-	xsk_ring_cons__release(&juice_xsk->rx, sum);
+	xsk_ring_cons__release(&juice_xdp->rx, sum);
 	return sum;
 }
 
 // INFO: 從 RX ring 取一個封包，回傳長度，若沒有則回傳 -1
 // FUTURE: 一次接收多個封包，目前 sum 非 0 即 1，等於原本的 recvfrom()
 // int receive_xsk_packet(char *buffer, addr_record_t *src) {
-// 	if (!juice_xsk) {
-// 		JLOG_FATAL("PurpleRed: juice_xsk is not exist");
+// 	if (!juice_xdp) {
+// 		JLOG_FATAL("PurpleRed: juice_xdp is not exist");
 // 		return -1;
 // 	}
 // 	// INFO: 首先查看 RX ring (rx) 目前有幾個 UMEM frame descriptor 可接收，從哪裡開始接收
 // 	unsigned int idx = 0;
-// 	int sum = xsk_ring_cons__peek(&juice_xsk->rx, 1, &idx);
+// 	int sum = xsk_ring_cons__peek(&juice_xdp->rx, 1, &idx);
 // 	if (!sum) return -1;
 // 	JLOG_DEBUG("PurpleRed: peek");
 // 	// INFO: 從 rx[idx] 開始取 descriptor (desc)，再從 umem_area 取封包內容，重複 sum 次
 // 	int *len;
 // 	for (int i = 0; i < sum; i++) {
-// 		const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&juice_xsk->rx, idx++);
-// 		void *packet = xsk_umem__get_data(juice_xsk->umem_area, desc->addr);
+// 		const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&juice_xdp->rx, idx++);
+// 		void *packet = xsk_umem__get_data(juice_xdp->umem_area, desc->addr);
 // 		packet_handler(packet, desc->len, buffer, len, src);
 // 	}
-// 	xsk_ring_cons__release(&juice_xsk->rx, sum);
+// 	xsk_ring_cons__release(&juice_xdp->rx, sum);
 // 	return len;
 // }
 
 
 // INFO: receive_xsk_packets() 每收到一個封包，就會呼叫此函式一次，用來拆解 L2~L4 層
-void packet_handler(xsk_socket_info_t *juice_xsk, void *raw_pkt, int raw_pkt_len) {
-	pipe_recv_t pkt;
+void packet_handler(xdp_info_t *juice_xdp, void *raw_pkt, int raw_pkt_len) {
+	agent_recv_t pkt;
 	memset(&pkt, 0, sizeof(pkt));
 
 	wss_metadata_t *metadata = (wss_metadata_t *)raw_pkt;
@@ -228,13 +228,13 @@ void packet_handler(xsk_socket_info_t *juice_xsk, void *raw_pkt, int raw_pkt_len
 }
 
 // INFO: 寫入 socket fd 和 pipe_out fd 至 wss_map[port]
-int create_wss_map_member(socket_t sock, int pipe_out, xsk_socket_info_t *juice_xsk) {
+int create_wss_map_member(socket_t sock, int pipe_out, xdp_info_t *juice_xdp) {
 	uint16_t port = udp_get_port(sock);
 	wss_value_t value;
 	memset(&value, 0, sizeof(value));
 	value.socket_fd = sock;
 	value.pipe_out_fd = pipe_out;
-	if (bpf_map_update_elem(juice_xsk->wss_map_fd, &port, &value, BPF_ANY) == 0) {
+	if (bpf_map_update_elem(juice_xdp->wss_map_fd, &port, &value, BPF_ANY) == 0) {
 		JLOG_INFO("PurpleRed: XDP will redirect all packets sent to port %hu to pipe (fd = %d)",
 		          port, pipe_out);
 		return 0;
@@ -246,9 +246,9 @@ int create_wss_map_member(socket_t sock, int pipe_out, xsk_socket_info_t *juice_
 }
 
 
-void remove_from_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk) {
+void remove_from_wss_map(socket_t sock, xdp_info_t *juice_xdp) {
 	uint16_t port = udp_get_port(sock);
-	int wss_map_fd = juice_xsk->wss_map_fd;
+	int wss_map_fd = juice_xdp->wss_map_fd;
 	if (bpf_map_delete_elem(wss_map_fd, &port) == 0) {
 		JLOG_INFO("PurpleRed: Removed port %hu from wss_map", port);
 	}
@@ -257,17 +257,17 @@ void remove_from_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk) {
 }
 
 
-void free_xsk_resources(xsk_socket_info_t *juice_xsk, int option) {
+void juice_xdp_cleanup(xdp_info_t *juice_xdp, int option) {
 	switch (option) {
 	case 3:
-		xsk_socket__delete(juice_xsk->xsk);
+		xsk_socket__delete(juice_xdp->xsk);
 	case 2:
-		xsk_umem__delete(juice_xsk->umem);
+		xsk_umem__delete(juice_xdp->umem);
 	case 1:
-		munmap(juice_xsk->umem_area, 4096 * 4096);
+		munmap(juice_xdp->umem_area, 4096 * 4096);
 	case 0:
 	default:
-		free(juice_xsk);
+		free(juice_xdp);
 	}
 }
 

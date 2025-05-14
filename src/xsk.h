@@ -4,9 +4,11 @@
 
 #include "udp.h"
 
+#include <stdatomic.h>
 #include <xdp/xsk.h>
 
-typedef struct xsk_socket_info {
+// INFO: 紀錄 XDP 所需的所有內容（全域只有一個，為 conn_registry_t 的成員）
+typedef struct xdp_info {
 	uint32_t wss_map_fd;
 	uint32_t xsk_map_fd;
 
@@ -20,7 +22,7 @@ typedef struct xsk_socket_info {
 	struct xsk_ring_cons rx; // 讀取 frame descriptor 以獲得封包 -> consumer
 	struct xsk_ring_prod tx;
 	int xsk_fd;
-} xsk_socket_info_t;
+} xdp_info_t;
 
 // INFO: 必須與 XDP 程式的 wss_metadata 資料結構保持一致
 typedef struct wss_metadata {
@@ -39,19 +41,27 @@ typedef struct wss_value {
 	__u32 pipe_out_fd;
 } wss_value_t;
 
-typedef struct pipe_recv {
+// INFO: xdp_agent_ring_t 的傳送單位
+typedef struct agent_recv {
 	addr_record_t src;
 	void *payload;
 	int payload_len;
-} pipe_recv_t;
+} agent_recv_t;
 
-int initialize_xsk(xsk_socket_info_t **juice_xsk);
+// INFO: XSK 將封包分配給各個 agent 所使用的 ring buffer
+typedef struct xdp_agent_ring {
+	agent_recv_t *buffer[1024];
+	atomic_uint head; // consumer read (agent)
+	atomic_uint tail; // producer write (XSK)
+} xdp_agent_ring_t;
+
+int initialize_juice_xdp(xdp_info_t **juice_xdp);
 void prime_fill_ring(struct xsk_ring_prod *fill);
-int receive_xsk_packets(xsk_socket_info_t *juice_xsk);
-void packet_handler(xsk_socket_info_t *juice_xsk, void *packet, int packet_len);
-int create_wss_map_member(socket_t sock, int pipe_out, xsk_socket_info_t *juice_xsk);
-void remove_from_wss_map(socket_t sock, xsk_socket_info_t *juice_xsk);
-void free_xsk_resources(xsk_socket_info_t *juice_xsk, int option);
+int receive_xsk_packets(xdp_info_t *juice_xdp);
+void packet_handler(xdp_info_t *juice_xdp, void *packet, int packet_len);
+int create_wss_map_member(socket_t sock, int pipe_out, xdp_info_t *juice_xdp);
+void remove_from_wss_map(socket_t sock, xdp_info_t *juice_xdp);
+void juice_xdp_cleanup(xdp_info_t *juice_xdp, int option);
 
 #endif
 #endif

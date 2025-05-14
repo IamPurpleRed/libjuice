@@ -137,8 +137,8 @@ void conn_poll_registry_cleanup(conn_registry_t *registry) {
 	registry->impl = NULL;
 
 #if USE_XDP
-	free_xsk_resources(registry->juice_xsk, 3);
-	registry->juice_xsk = NULL;
+	juice_xdp_cleanup(registry->juice_xdp, 3);
+	registry->juice_xdp = NULL;
 #endif
 }
 
@@ -174,7 +174,7 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 
 #if USE_XDP
 	struct pollfd *xsk_pfd = pfds->pfds + 1;
-	xsk_pfd->fd = registry->juice_xsk->xsk_fd;
+	xsk_pfd->fd = registry->juice_xdp->xsk_fd;
 	xsk_pfd->events = POLLIN;
 
 	for (nfds_t i = 2; i < pfds->size; ++i) {
@@ -244,10 +244,10 @@ error:
 #if USE_XDP
 int conn_poll_recv(int pipe_in_fd, char *buffer, addr_record_t *src) {
 	JLOG_VERBOSE("Receiving datagram");
-	pipe_recv_t pkt;
+	agent_recv_t pkt;
 	int ret;
 	while (true) {
-		if ((ret = read(pipe_in_fd, &pkt, sizeof(pipe_recv_t))) == sizeof(pipe_recv_t) &&
+		if ((ret = read(pipe_in_fd, &pkt, sizeof(agent_recv_t))) == sizeof(agent_recv_t) &&
 		    pkt.payload_len == 0)
 			continue; // Empty datagram, ignore
 		else break;
@@ -311,7 +311,7 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 #if USE_XDP
 	struct pollfd *xsk_pfd = pfds->pfds + 1;
 	if (xsk_pfd->revents & POLLIN) {
-		receive_xsk_packets(registry->juice_xsk);
+		receive_xsk_packets(registry->juice_xdp);
 	}
 
 	for (nfds_t i = 2; i < pfds->size; ++i) {
@@ -498,7 +498,7 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 	conn_impl->pipe_in = pipefds[0];
 	conn_impl->pipe_out = pipefds[1];
 
-	if (create_wss_map_member(conn_impl->sock, conn_impl->pipe_out, registry->juice_xsk)) {
+	if (create_wss_map_member(conn_impl->sock, conn_impl->pipe_out, registry->juice_xdp)) {
 		free(conn_impl);
 		return -1;
 	}
@@ -518,7 +518,7 @@ void conn_poll_cleanup(juice_agent_t *agent) {
 
 	mutex_destroy(&conn_impl->send_mutex);
 #if USE_XDP
-	remove_from_wss_map(conn_impl->sock, agent->registry->juice_xsk);
+	remove_from_wss_map(conn_impl->sock, agent->registry->juice_xdp);
 #endif
 	closesocket(conn_impl->sock);
 	free(agent->conn_impl);

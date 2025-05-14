@@ -35,7 +35,7 @@ typedef struct conn_registry {
 	int agents_size;
 	int agents_count;
 #if USE_XDP
-	xsk_socket_info_t *juice_xsk;
+	xdp_info_t *juice_xdp;
 #endif
 } conn_registry_t;
 
