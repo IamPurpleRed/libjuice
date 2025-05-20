@@ -13,11 +13,15 @@
 #include <pthread.h>
 #include <socket.h>
 #include <stdlib.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #define FRAME_SIZE 2048
 #define FILL_RING_SIZE 4096
 
+void prime_fill_ring(struct xsk_ring_prod *fill);
+void packet_handler(xdp_info_t *juice_xdp, void *packet, int packet_len);
 
 int initialize_juice_xdp(xdp_info_t **juice_xdp_ptr) {
 	if (*juice_xdp_ptr)
@@ -25,7 +29,7 @@ int initialize_juice_xdp(xdp_info_t **juice_xdp_ptr) {
 
 	*juice_xdp_ptr = calloc(1, sizeof(xdp_info_t));
 	if (!juice_xdp_ptr) {
-		JLOG_FATAL("PurpleRed: Memory allocation for juice_xdp failed");
+		JLOG_FATAL("PurpleRed: Memory allocation for conn_registry_t->juice_xdp failed");
 		return -1;
 	}
 	xdp_info_t *juice_xdp = *juice_xdp_ptr;
@@ -113,43 +117,70 @@ int initialize_juice_xdp(xdp_info_t **juice_xdp_ptr) {
 	return 0;
 }
 
-
-// TODO: 只能收 4096 個 frame
-void prime_fill_ring(struct xsk_ring_prod *fill) {
-	uint32_t idx;
-	int ret;
-
-	int frames_to_add = FILL_RING_SIZE;
-
-	// while (frames_to_add > 0) {
-		// 請求 fill ring，看看是否有足夠空位能塞 frames_to_add 個「frame offset」
-		ret = xsk_ring_prod__reserve(fill, frames_to_add, &idx);
-		if (ret != frames_to_add) {
-			// 表示 fill ring 現在還不能一次容納全部 frames_to_add
-			// 這裡可以先塞 ret 個，然後再繼續迴圈，或 sleep 後重試
-			// 先示範簡單作法：就先塞 ret 個
-			frames_to_add -= ret;
-		}
-
-		// ret 可能是 >= 0 的數值，如果 ret=0，表示根本reserve不到，可能要再跑迴圈
-		for (int i = 0; i < ret; i++) {
-			// 塞入 frame offset (相對於 umem_area 的位移量)
-			// 假設把 frame i 對應到 offset = i * FRAME_SIZE
-			// 也可能要用 (base_index + i) 來計算，視你要如何管理 frames
-			*xsk_ring_prod__fill_addr(fill, idx + i) = (i * FRAME_SIZE);
-		}
-
-		// 告訴核心，我們這次總共「提交」了 ret 個可用 frame
-		xsk_ring_prod__submit(fill, ret);
-	    JLOG_INFO("PurpleRed: Prime %d frames to fill ring", ret);
-
-	    // 全部提交完就跳出
-		// if (ret > 0 && ret == frames_to_add + ret) {
-		// 	frames_to_add = 0;
-		// }
-	// }
+void juice_xdp_cleanup(xdp_info_t *juice_xdp, int option) {
+	switch (option) {
+	case 3:
+		xsk_socket__delete(juice_xdp->xsk);
+	case 2:
+		xsk_umem__delete(juice_xdp->umem);
+	case 1:
+		munmap(juice_xdp->umem_area, 4096 * 4096);
+	case 0:
+	default:
+		free(juice_xdp);
+	}
 }
 
+int initialize_recv_rb(xdp_agent_rb_t **recv_rb_ptr) {
+	if (*recv_rb_ptr)
+		return 0; // 已初始化
+
+	*recv_rb_ptr = calloc(1, sizeof(xdp_agent_rb_t));
+	if (!recv_rb_ptr) {
+		JLOG_FATAL("PurpleRed: Memory allocation for conn_impl_t->recv_rb failed");
+		return -1;
+	}
+	xdp_agent_rb_t *recv_rb = *recv_rb_ptr;
+
+	recv_rb->efd = eventfd(0, EFD_NONBLOCK);
+	if (recv_rb->efd < 0) {
+		JLOG_FATAL("PurpleRed: recv_rb->efd creation failed");
+		free(recv_rb);
+		return -1;
+	}
+
+	memset(recv_rb->buffer, 0, sizeof(recv_rb->buffer));
+	atomic_init(&(recv_rb->head), 0);
+	atomic_init(&(recv_rb->tail), 0);
+
+	return 0;
+}
+
+void recv_rb_cleanup(xdp_agent_rb_t *recv_rb) {}
+
+// INFO: 新增 wss_map[port] = xdp_agent_rb_t 的位址
+int add_port_to_wss_map(xdp_info_t *juice_xdp, socket_t sock, xdp_agent_rb_t *ptr) {
+	uint16_t port = udp_get_port(sock);
+	__u64 value = (__u64)(uintptr_t)ptr;  // uintptr_t: 安全的將指標轉型成整數
+	if (bpf_map_update_elem(juice_xdp->wss_map_fd, &port, &value, BPF_ANY) == 0) {
+		JLOG_INFO("PurpleRed: XDP will redirect all packets sent to port %hu", port);
+		return 0;
+	}
+
+	JLOG_ERROR("PurpleRed: Failed to update eBPF map with port %hu", port);
+
+	return -1;
+}
+
+void remove_port_from_wss_map(socket_t sock, xdp_info_t *juice_xdp) {
+	uint16_t port = udp_get_port(sock);
+	int wss_map_fd = juice_xdp->wss_map_fd;
+	if (bpf_map_delete_elem(wss_map_fd, &port) == 0) {
+		JLOG_INFO("PurpleRed: Removed port %hu from wss_map", port);
+	}
+
+	JLOG_WARN("PurpleRed: Failed to remove port %hu from wss_map", port);
+}
 
 int receive_xsk_packets(xdp_info_t *juice_xdp) {
 	if (!juice_xdp) {
@@ -171,6 +202,85 @@ int receive_xsk_packets(xdp_info_t *juice_xdp) {
 
 	xsk_ring_cons__release(&juice_xdp->rx, sum);
 	return sum;
+}
+
+// TODO: 只能收 4096 個 frame
+void prime_fill_ring(struct xsk_ring_prod *fill) {
+	uint32_t idx;
+	int ret;
+
+	int frames_to_add = FILL_RING_SIZE;
+
+	// while (frames_to_add > 0) {
+	// 請求 fill ring，看看是否有足夠空位能塞 frames_to_add 個「frame offset」
+	ret = xsk_ring_prod__reserve(fill, frames_to_add, &idx);
+	if (ret != frames_to_add) {
+		// 表示 fill ring 現在還不能一次容納全部 frames_to_add
+		// 這裡可以先塞 ret 個，然後再繼續迴圈，或 sleep 後重試
+		// 先示範簡單作法：就先塞 ret 個
+		frames_to_add -= ret;
+	}
+
+	// ret 可能是 >= 0 的數值，如果 ret=0，表示根本reserve不到，可能要再跑迴圈
+	for (int i = 0; i < ret; i++) {
+		// 塞入 frame offset (相對於 umem_area 的位移量)
+		// 假設把 frame i 對應到 offset = i * FRAME_SIZE
+		// 也可能要用 (base_index + i) 來計算，視你要如何管理 frames
+		*xsk_ring_prod__fill_addr(fill, idx + i) = (i * FRAME_SIZE);
+	}
+
+	// 告訴核心，我們這次總共「提交」了 ret 個可用 frame
+	xsk_ring_prod__submit(fill, ret);
+	JLOG_INFO("PurpleRed: Prime %d frames to fill ring", ret);
+
+	// 全部提交完就跳出
+	// if (ret > 0 && ret == frames_to_add + ret) {
+	// 	frames_to_add = 0;
+	// }
+	// }
+}
+
+// INFO: receive_xsk_packets() 每收到一個封包，就會呼叫此函式一次，用來拆解 wss_metadata_t
+void packet_handler(xdp_info_t *juice_xdp, void *raw_pkt, int raw_pkt_len) {
+	// 尋找 wss_metadata_t (raw_pkt 的最前面)
+	wss_metadata_t *metadata = (wss_metadata_t *)raw_pkt;
+
+	// 解析 xdp_agent_rb_ptr，判斷 rb 是否已滿，如果滿了就 drop 不處理
+	xdp_agent_rb_t *rb = (xdp_agent_rb_t *)(uintptr_t)(metadata->xdp_agent_rb_ptr);
+	unsigned int tail = atomic_load_explicit(&(rb->tail), memory_order_relaxed);
+	unsigned int next = (tail + 1) & 1023;
+	unsigned int head = atomic_load_explicit(&(rb->head), memory_order_acquire);
+	if (next == head) return; // drop
+
+	// 建立一個 addr_record_t，以放入 wss_metadata_t 的其它內容
+	addr_record_t *src = malloc(sizeof(addr_record_t));
+	memset(src, 0, sizeof(addr_record_t));
+	if (metadata->src_ip_version == 4) {
+		struct sockaddr_in *addr4 = (struct sockaddr_in *)&(src->addr);
+		addr4->sin_family = AF_INET;
+		addr4->sin_addr.s_addr = metadata->src_ipv4;  // network byte order
+		addr4->sin_port = metadata->src_port;         // network byte order
+		src->len = sizeof(struct sockaddr_in);
+	} else {
+		struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&(src->addr);
+		addr6->sin6_family = AF_INET6;
+		memcpy(addr6->sin6_addr.s6_addr, &(metadata->src_ipv6), 16);  // network byte order
+		addr6->sin6_port = metadata->src_port;                        // network byte order
+		src->len = sizeof(struct sockaddr_in6);
+	}
+
+	// 寫入 xdp_agent_rb，並更新 tail
+	agent_recv_t recv_data = {
+		.payload_len = raw_pkt_len - sizeof(wss_metadata_t),
+		.payload = (void *)(metadata + 1),
+		.src = src
+	};
+	rb->buffer[tail] = recv_data;
+	atomic_store_explicit(&(rb->tail), next, memory_order_release);
+
+	// 寫入 efd 通知 consumer
+	uint64_t inc = 1;
+	write(rb->efd, &inc, sizeof(inc));
 }
 
 // INFO: 從 RX ring 取一個封包，回傳長度，若沒有則回傳 -1
@@ -195,80 +305,5 @@ int receive_xsk_packets(xdp_info_t *juice_xdp) {
 // 	xsk_ring_cons__release(&juice_xdp->rx, sum);
 // 	return len;
 // }
-
-
-// INFO: receive_xsk_packets() 每收到一個封包，就會呼叫此函式一次，用來拆解 L2~L4 層
-void packet_handler(xdp_info_t *juice_xdp, void *raw_pkt, int raw_pkt_len) {
-	agent_recv_t pkt;
-	memset(&pkt, 0, sizeof(pkt));
-
-	wss_metadata_t *metadata = (wss_metadata_t *)raw_pkt;
-	pkt.payload = (void *)(metadata + 1);
-	pkt.payload_len = raw_pkt_len - sizeof(wss_metadata_t);
-	if (metadata->src_ip_version == 4) {
-		struct sockaddr_in *addr4 = (struct sockaddr_in *)&(pkt.src.addr);
-		addr4->sin_family = AF_INET;
-		addr4->sin_addr.s_addr = metadata->src_ipv4;  // network byte order
-		addr4->sin_port = metadata->src_port;         // network byte order
-		pkt.src.len = sizeof(struct sockaddr_in);
-
-		char ip_str[INET_ADDRSTRLEN];
-		inet_ntop(AF_INET, &(metadata->src_ipv4), ip_str, sizeof(ip_str));
-		uint16_t port = ntohs(metadata->src_port);
-	} else {
-		struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&(pkt.src.addr);
-		addr6->sin6_family = AF_INET6;
-		memcpy(addr6->sin6_addr.s6_addr, &(metadata->src_ipv6), 16);  // network byte order
-		addr6->sin6_port = metadata->src_port;                        // network byte order
-		pkt.src.len = sizeof(struct sockaddr_in6);
-	}
-
-	// INFO: 將 pkt 寫入 pipe
-	write(metadata->pipe_out_fd, &pkt, sizeof(pkt));
-}
-
-// INFO: 寫入 socket fd 和 pipe_out fd 至 wss_map[port]
-int create_wss_map_member(socket_t sock, int pipe_out, xdp_info_t *juice_xdp) {
-	uint16_t port = udp_get_port(sock);
-	wss_value_t value;
-	memset(&value, 0, sizeof(value));
-	value.socket_fd = sock;
-	value.pipe_out_fd = pipe_out;
-	if (bpf_map_update_elem(juice_xdp->wss_map_fd, &port, &value, BPF_ANY) == 0) {
-		JLOG_INFO("PurpleRed: XDP will redirect all packets sent to port %hu to pipe (fd = %d)",
-		          port, pipe_out);
-		return 0;
-	}
-
-	JLOG_ERROR("PurpleRed: Failed to update eBPF map with port %hu", port);
-
-	return -1;
-}
-
-
-void remove_from_wss_map(socket_t sock, xdp_info_t *juice_xdp) {
-	uint16_t port = udp_get_port(sock);
-	int wss_map_fd = juice_xdp->wss_map_fd;
-	if (bpf_map_delete_elem(wss_map_fd, &port) == 0) {
-		JLOG_INFO("PurpleRed: Removed port %hu from wss_map", port);
-	}
-
-	JLOG_WARN("PurpleRed: Failed to remove port %hu from wss_map", port);
-}
-
-
-void juice_xdp_cleanup(xdp_info_t *juice_xdp, int option) {
-	switch (option) {
-	case 3:
-		xsk_socket__delete(juice_xdp->xsk);
-	case 2:
-		xsk_umem__delete(juice_xdp->umem);
-	case 1:
-		munmap(juice_xdp->umem_area, 4096 * 4096);
-	case 0:
-	default:
-		free(juice_xdp);
-	}
-}
 
 #endif

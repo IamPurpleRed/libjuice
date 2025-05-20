@@ -42,8 +42,7 @@ typedef struct conn_impl {
 	int send_ds;
 	timestamp_t next_timestamp;
 #if USE_XDP
-	int pipe_out;
-	int pipe_in;
+	xdp_agent_rb_t *recv_rb;  // get payload & addr_record_t
 #endif
 } conn_impl_t;
 
@@ -55,7 +54,7 @@ typedef struct pfds_record {
 int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_t *next_timestamp);
 int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds);
 #if USE_XDP
-int conn_poll_recv(int pipe_in_fd, char *buffer, addr_record_t *src);
+int conn_poll_recv(xdp_agent_rb_t *rb, char *buffer, addr_record_t *src);
 #else
 int conn_poll_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src);
 #endif
@@ -200,7 +199,7 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 		if (*next_timestamp > conn_impl->next_timestamp)
 			*next_timestamp = conn_impl->next_timestamp;
 
-		pfd->fd = conn_impl->pipe_in;
+		pfd->fd = conn_impl->recv_rb->efd;
 		pfd->events = POLLIN;
 	}
 #else
@@ -242,31 +241,25 @@ error:
 }
 
 #if USE_XDP
-int conn_poll_recv(int pipe_in_fd, char *buffer, addr_record_t *src) {
+int conn_poll_recv(xdp_agent_rb_t *rb, char *buffer, addr_record_t *src) {
 	JLOG_VERBOSE("Receiving datagram");
-	agent_recv_t pkt;
-	int ret;
-	while (true) {
-		if ((ret = read(pipe_in_fd, &pkt, sizeof(agent_recv_t))) == sizeof(agent_recv_t) &&
-		    pkt.payload_len == 0)
-			continue; // Empty datagram, ignore
-		else break;
-    }
+	uint64_t dummy;
+	read(rb->efd, &dummy, sizeof(dummy));  // 讀取 eventfd -> 必為 1 -> 無意義
 
-	if (ret < 0) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
-			JLOG_VERBOSE("No more datagrams to receive");
-			return 0;
-		}
-		JLOG_ERROR("PurpleRed: failed to read pipe_in, errno=%d", errno);
-		return -1;
-	}
-	
-	memcpy(buffer, pkt.payload, pkt.payload_len);
-	memcpy(src, &(pkt.src), sizeof(addr_record_t));
+	unsigned int head = atomic_load_explicit(&(rb->head), memory_order_relaxed);
+	unsigned int tail = atomic_load_explicit(&(rb->tail), memory_order_acquire);
+	if (head == tail) return 0;  // drop
+
+	agent_recv_t recv_data = rb->buffer[head];
+	unsigned int next = (head + 1) & 1023;
+	atomic_store_explicit(&(rb->head), next, memory_order_release);
+	memcpy(buffer, recv_data.payload, recv_data.payload_len);
+	memcpy(src, (void *)(recv_data.src), sizeof(addr_record_t));
+	// TODO: free umem frame
+	free(recv_data.src);
 	addr_unmap_inet6_v4mapped((struct sockaddr *)&src->addr, &src->len);
 
-	return pkt.payload_len; // len > 0
+	return recv_data.payload_len;
 }
 #else
 int conn_poll_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
@@ -324,7 +317,7 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 			continue;
 
 		conn_impl_t *conn_impl = agent->conn_impl;
-		if (!conn_impl || conn_impl->pipe_in != pfd->fd || conn_impl->state != CONN_STATE_READY)
+		if (!conn_impl || conn_impl->recv_rb->efd != pfd->fd || conn_impl->state != CONN_STATE_READY)
 			continue;
 
 		if (pfd->revents & POLLNVAL || pfd->revents & POLLERR) {
@@ -339,15 +332,13 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 			addr_record_t src;
 			int ret = 0;
 			int left = 1000; // limit for fairness between pipes
-			while (left-- &&
-			       (ret = conn_poll_recv(conn_impl->pipe_in, buffer, &src)) > 0) {
+			while (left-- && (ret = conn_poll_recv(conn_impl->recv_rb, buffer, &src)) > 0) {
 				if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
 					JLOG_WARN("Agent receive failed");
 					conn_impl->state = CONN_STATE_FINISHED;
 					break;
 				}
 			}
-			// TODO: free umem frame
 
 			if (conn_impl->state == CONN_STATE_FINISHED)
 			continue;
@@ -486,19 +477,13 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 	}
 
 #if USE_XDP
-	int pipefds[2];
-	if (pipe(pipefds)) {
-		JLOG_FATAL("PurpleRed: Pipe creation failed");
+	if (initialize_recv_rb(&(conn_impl->recv_rb))) {
+		JLOG_FATAL("PurpleRed: conn_impl_t->recv_rb creation failed");
 		free(conn_impl);
 		return -1;
 	}
 
-	fcntl(pipefds[0], F_SETFL, O_NONBLOCK);
-	fcntl(pipefds[1], F_SETFL, O_NONBLOCK);
-	conn_impl->pipe_in = pipefds[0];
-	conn_impl->pipe_out = pipefds[1];
-
-	if (create_wss_map_member(conn_impl->sock, conn_impl->pipe_out, registry->juice_xdp)) {
+	if (add_port_to_wss_map(registry->juice_xdp, conn_impl->sock, conn_impl->recv_rb)) {
 		free(conn_impl);
 		return -1;
 	}
@@ -518,7 +503,7 @@ void conn_poll_cleanup(juice_agent_t *agent) {
 
 	mutex_destroy(&conn_impl->send_mutex);
 #if USE_XDP
-	remove_from_wss_map(conn_impl->sock, agent->registry->juice_xdp);
+	remove_port_from_wss_map(conn_impl->sock, agent->registry->juice_xdp);
 #endif
 	closesocket(conn_impl->sock);
 	free(agent->conn_impl);
