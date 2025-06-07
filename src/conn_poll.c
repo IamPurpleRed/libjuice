@@ -59,13 +59,13 @@ typedef struct pfds_record {
 int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_t *next_timestamp);
 int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds);
 #if USE_XDP
-int conn_poll_recv(xdp_agent_rb_t *rb, char *buffer, addr_record_t *src);
+int conn_poll_recv(xdp_agent_rb_t *rb, char *buffer, addr_record_t *src, uint64_t *ts3);  // EXPERIMENT: ts3 參數
 #else
 int conn_poll_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src);
 #endif
 int conn_poll_run(conn_registry_t *registry);
 
-void experiment(conn_registry_t *registry);  // EXPERIMENT
+void write_experiment_file(conn_registry_t *registry, uint64_t ts3); // EXPERIMENT
 
 static thread_return_t THREAD_CALL conn_thread_entry(void *arg) {
 	thread_set_name_self("juice poll");
@@ -248,7 +248,8 @@ error:
 }
 
 #if USE_XDP
-int conn_poll_recv(xdp_agent_rb_t *rb, char *buffer, addr_record_t *src) {
+// EXPERIMENT: ts3 參數
+int conn_poll_recv(xdp_agent_rb_t *rb, char *buffer, addr_record_t *src, uint64_t *ts3) {
 	JLOG_VERBOSE("Receiving datagram");
 	uint64_t dummy;
 	read(rb->efd, &dummy, sizeof(dummy));  // 讀取 eventfd -> 必為 1 -> 無意義
@@ -262,6 +263,7 @@ int conn_poll_recv(xdp_agent_rb_t *rb, char *buffer, addr_record_t *src) {
 	atomic_store_explicit(&(rb->head), next, memory_order_release);
 	memcpy(buffer, recv_data.payload, recv_data.payload_len);
 	memcpy(src, (void *)(recv_data.src), sizeof(addr_record_t));
+	*ts3 = recv_data.ts3;  // EXPERIMENT
 	// TODO: free umem frame
 	free(recv_data.src);
 	addr_unmap_inet6_v4mapped((struct sockaddr *)&src->addr, &src->len);
@@ -337,12 +339,14 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 		if (pfd->revents & POLLIN) {
 			char buffer[BUFFER_SIZE];
 			addr_record_t src;
+			uint64_t ts3;
 			int ret = 0;
 			int left = 1000; // limit for fairness between pipes
-			while (left-- && (ret = conn_poll_recv(conn_impl->recv_rb, buffer, &src)) > 0) {
+			// EXPERIMENT: conn_poll_recv() 的 ts3 參數
+			while (left-- && (ret = conn_poll_recv(conn_impl->recv_rb, buffer, &src, &ts3)) > 0) {
 				// EXPERIMENT
 				if (registry->packet_count < PKT_COUNT) {
-					experiment(registry);
+					write_experiment_file(registry, ts3);
 				}
 				// EXPERIMENT END
 
@@ -406,7 +410,7 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 			       (ret = conn_poll_recv(conn_impl->sock, buffer, BUFFER_SIZE, &src)) > 0) {
 				// EXPERIMENT
 				if (registry->packet_count < PKT_COUNT) {
-					experiment(registry);
+					write_experiment_file(registry, 0);
 				}
 				// EXPERIMENT END
 
@@ -628,18 +632,22 @@ int conn_poll_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t siz
 }
 
 // EXPERIMENT
-// INFO: 紀錄第二個時間點，如果已經接收 PKT_COUNT 個封包，呼叫 calc_result()
-void experiment(conn_registry_t *registry) {
+// INFO: timestamp4 & 寫入 result.csv
+void write_experiment_file(conn_registry_t *registry, uint64_t ts3) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
-	uint64_t time1, time2 = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 	registry->packet_count++;
-	if (bpf_map_lookup_elem(registry->experiment_map_fd, &(registry->packet_count), &time1) != 0) {
+	times_t t;
+	if (bpf_map_lookup_elem(registry->experiment_map_fd, &(registry->packet_count), &t) != 0) {
 		JLOG_WARN("PurpleRed: Read experiment_map[%d] failed", registry->packet_count);
 		return;
 	}
-
-	fprintf(registry->fp, "%llu,%llu,%llu\n", time1, time2, time2 - time1);
+	t.juice_in = ts3;
+	t.distributed = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec; // 紀錄 timestamp4
+	if (bpf_map_update_elem(registry->experiment_map_fd, &(registry->packet_count), &t, BPF_ANY) != 0) {
+		JLOG_WARN("PurpleRed: Failed to update experiment_map[%d]", registry->packet_count);
+	}
+	fprintf(registry->fp, "%llu,%llu,%llu,%llu\n", t.xdp_in, t.xdp_out, t.juice_in, t.distributed);
 	if (registry->packet_count == PKT_COUNT) {
 		fclose(registry->fp);
 	}

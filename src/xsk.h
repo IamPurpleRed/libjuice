@@ -37,6 +37,7 @@ typedef struct wss_metadata {
 
 // INFO: xdp_agent_rb_t 的傳送單位
 typedef struct agent_recv {
+	uint64_t ts3;  // EXPERIMENT
 	int payload_len;
 	void *payload;
 	addr_record_t *src;
@@ -46,8 +47,8 @@ typedef struct agent_recv {
 typedef struct xdp_agent_rb {
 	int efd;
 	agent_recv_t buffer[1024];
-	atomic_uint head; // consumer read (agent)
-	atomic_uint tail; // producer write (XSK)
+	atomic_uint head;  // consumer read (agent)
+	atomic_uint tail;  // producer write (XSK)
 } xdp_agent_rb_t;
 
 int initialize_juice_xdp(xdp_info_t **juice_xdp_ptr);

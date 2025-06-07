@@ -46,6 +46,15 @@ typedef struct conn_registry {
 	int packet_count;           // EXPERIMENT
 } conn_registry_t;
 
+// INFO: 紀錄四個 timestamp，必須與 XDP 程式的 struct times 保持一致
+// 分別是：一進入 XDP 程式，離開 XDP 程式前，一進入 libjuice，被分配到正確位置
+typedef struct times {
+	__u64 xdp_in;      // timestamp1
+	__u64 xdp_out;     // timestamp2
+	__u64 juice_in;    // timestamp3
+	__u64 distributed; // timestamp4
+} times_t;
+
 typedef struct conn_mode_entry {
 	int (*registry_init_func)(conn_registry_t *registry, udp_socket_config_t *config);
 	void (*registry_cleanup_func)(conn_registry_t *registry);

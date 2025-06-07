@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <time.h>    // EXPERIMENT
 #include <unistd.h>
 
 #define FRAME_SIZE 2048
@@ -242,6 +243,11 @@ void prime_fill_ring(struct xsk_ring_prod *fill) {
 
 // INFO: receive_xsk_packets() 每收到一個封包，就會呼叫此函式一次，用來拆解 wss_metadata_t
 void packet_handler(xdp_info_t *juice_xdp, void *raw_pkt, int raw_pkt_len) {
+	// EXPERIMENT: timestamp3
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	// EXPERIMENT END
+
 	// 尋找 wss_metadata_t (raw_pkt 的最前面)
 	wss_metadata_t *metadata = (wss_metadata_t *)raw_pkt;
 
@@ -271,9 +277,10 @@ void packet_handler(xdp_info_t *juice_xdp, void *raw_pkt, int raw_pkt_len) {
 
 	// 寫入 xdp_agent_rb，並更新 tail
 	agent_recv_t recv_data = {
-		.payload_len = raw_pkt_len - sizeof(wss_metadata_t),
-		.payload = (void *)(metadata + 1),
-		.src = src
+		.ts3 = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec, // EXPERIMENT: 紀錄 timestamp3
+	    .payload_len = raw_pkt_len - sizeof(wss_metadata_t),
+	    .payload = (void *)(metadata + 1),
+	    .src = src
 	};
 	rb->buffer[tail] = recv_data;
 	atomic_store_explicit(&(rb->tail), next, memory_order_release);

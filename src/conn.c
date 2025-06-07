@@ -130,7 +130,7 @@ static int acquire_registry(conn_mode_entry_t *entry, udp_socket_config_t *confi
 			free(registry);
 			return -1;
 		}
-		fprintf(registry->fp, "time1,time2,delta\n");  // 寫入標題列
+		fprintf(registry->fp, "timestamp1,timestamp2,timestamp3,timestamp4\n");  // 寫入標題列
 		// EXPERIMENT END
 
 		// EXPERIMENT: 尋找 experiment_map 的 file descriptor
@@ -148,7 +148,7 @@ static int acquire_registry(conn_mode_entry_t *entry, udp_socket_config_t *confi
 		// EXPERIMENT: 初始化 experiment_map (全部歸零)
 		registry->experiment_map_fd = experiment_map_fd;
 		registry->packet_count = 0;
-		const long long int zero = 0;
+		times_t zero = {};
 		for (int i = 0; i <= PKT_COUNT; i++) {
 			if (bpf_map_update_elem(experiment_map_fd, &i, &zero, BPF_ANY) != 0) {
 				JLOG_FATAL("PurpleRed: Failed to write 0 to experiment_map[%d]", i);
